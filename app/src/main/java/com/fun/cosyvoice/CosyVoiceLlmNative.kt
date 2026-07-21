@@ -1,4 +1,4 @@
-package com.fun.cosyvoice
+package com.cosyvoice.app
 
 internal object CosyVoiceLlmNative {
     init {

@@ -1,4 +1,4 @@
-package com.fun.cosyvoice
+package com.cosyvoice.app
 
 import android.util.Log
 import kotlinx.coroutines.currentCoroutineContext
@@ -11,6 +11,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 
 data class CosyVoiceSynthesisOptions(
+    val flowBackend: String = CosyVoiceRuntime.detectBestFlowBackend(),
     val flowGpuMode: Int = 68,
     val hiftCoreBackend: String = "cpu",
     val hiftGpuMode: Int = 4,
@@ -18,7 +19,11 @@ data class CosyVoiceSynthesisOptions(
     val inferenceMode: CosyVoiceInferenceMode = CosyVoiceInferenceMode.ZERO_SHOT,
     val instruction: String = ""
 ) {
+    val flowPrecision: String get() = if (flowBackend == "cpu") "normal" else "high"
+    val flowThreads: Int get() = if (flowBackend == "cpu") 6 else flowGpuMode
+
     init {
+        require(flowBackend in setOf("cpu", "opencl"))
         require(flowGpuMode in setOf(4, 68, 132))
         require(hiftCoreBackend in setOf("cpu", "opencl"))
         require(hiftGpuMode in setOf(4, 68, 132))
@@ -52,15 +57,29 @@ data class CosyVoiceSynthesisReport(
         append("\nLLM %.2f 秒 · Flow %.2f 秒（首次/形状 %.2f 秒）· HiFT %.2f 秒".format(
             llmMs / 1000.0, flowInferenceMs / 1000.0, flowResizeMs / 1000.0, hiftMs / 1000.0
         ))
-        append("\n音色 ${voiceProfile.displayName} · ${options.inferenceMode.displayName()} · Flow GPU mode ${options.flowGpuMode} · HiFT ${options.hiftCoreBackend} · peak %.3f · rms %.3f".format(pcmPeak, pcmRms))
+        append("\n音色 ${voiceProfile.displayName} · ${options.inferenceMode.displayName()} · Flow ${options.flowBackend} mode ${options.flowGpuMode} · HiFT ${options.hiftCoreBackend} · peak %.3f · rms %.3f".format(pcmPeak, pcmRms))
     }
 }
 
 internal object CosyVoiceRuntime {
     private const val TAG = "CosyVoiceRuntime"
     private const val HIFT_CPU_THREADS = 6
+    private const val FLOW_CPU_THREADS = 6
     private val mutex = Mutex()
     private val activeProcess = AtomicReference<Process?>(null)
+
+    private val openClAvailable: Boolean by lazy {
+        try {
+            System.loadLibrary("OpenCL")
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun detectBestFlowBackend(): String {
+        return if (openClAvailable) "opencl" else "cpu"
+    }
 
     suspend fun synthesize(
         store: CosyVoiceStore,
@@ -135,7 +154,7 @@ internal object CosyVoiceRuntime {
         )
         currentCoroutineContext().ensureActive()
 
-        onStage("Flow 正在使用 GPU 合成 Mel")
+        onStage(if (options.flowBackend == "opencl") "Flow 正在使用 GPU 合成 Mel" else "Flow 正在使用 CPU 合成 Mel")
         val flowManifest = File(runDir, "flow-manifest.txt").apply {
             writeText(
                 "${flowInput.absolutePath} ${flowOutput.absolutePath} $sequenceLength ${voiceProfile.promptFrameCount} $flowBucket\n",
@@ -143,13 +162,13 @@ internal object CosyVoiceRuntime {
             )
         }
         val flowReportFile = File(runDir, "flow-report.jsonl")
-        val flowCache = File(store.gpuCacheDir, "flow-fp16-opencl-high-mode${options.flowGpuMode}.cache")
+        val flowCache = File(store.gpuCacheDir, "flow-fp16-${options.flowBackend}-${options.flowPrecision}-mode${options.flowGpuMode}.cache")
         val flowExitCode = CosyVoiceFlowNative.run(
             modelPath = File(model, "flow.cfg-student-2step.batch1.fp16.mnn").absolutePath,
             manifestPath = flowManifest.absolutePath,
-            backend = "opencl",
-            precision = "high",
-            threads = options.flowGpuMode,
+            backend = options.flowBackend,
+            precision = options.flowPrecision,
+            threads = options.flowThreads,
             reportPath = flowReportFile.absolutePath,
             cachePath = flowCache.absolutePath
         )

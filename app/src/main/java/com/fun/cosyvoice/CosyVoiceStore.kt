@@ -1,4 +1,4 @@
-package com.fun.cosyvoice
+package com.cosyvoice.app
 
 import android.content.Context
 import android.net.Uri
@@ -85,7 +85,9 @@ class CosyVoiceStore(context: Context) {
         .orEmpty().ifBlank { DEFAULT_VOICE_PROFILE_ID }
 
     fun selectVoiceProfile(id: String) {
-        voiceProfile(id)
+        if (modelStatus().ready) {
+            voiceProfile(id)
+        }
         preferences.edit().putString(SELECTED_PROFILE_KEY, id).apply()
     }
 

@@ -7,7 +7,7 @@ plugins {
 
 android {
     compileSdk = 36
-    namespace = "com.fun.cosyvoice"
+    namespace = "com.cosyvoice.app"
 
     kotlin {
         jvmToolchain {
@@ -16,7 +16,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.fun.cosyvoice"
+        applicationId = "com.cosyvoice.app"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

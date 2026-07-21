@@ -1,4 +1,4 @@
-package com.fun.cosyvoice
+package com.cosyvoice.app
 
 import android.media.MediaPlayer
 import android.net.Uri
@@ -149,7 +149,7 @@ class MainActivity : ComponentActivity() {
         modelStatus = store.modelStatus()
         enrollmentStatus = store.enrollmentStatus()
         voiceProfiles = if (modelStatus.ready) store.voiceProfiles() else emptyList()
-        if (voiceProfiles.none { it.id == selectedVoiceProfileId }) {
+        if (modelStatus.ready && voiceProfiles.none { it.id == selectedVoiceProfileId }) {
             selectedVoiceProfileId = CosyVoiceStore.DEFAULT_VOICE_PROFILE_ID
             store.selectVoiceProfile(selectedVoiceProfileId)
         }
@@ -384,6 +384,7 @@ private fun CosyVoiceManagerScreen(
     onPreview: (String, CosyVoiceSynthesisOptions) -> Unit
 ) {
     var previewText by androidx.compose.runtime.remember { mutableStateOf("你好，欢迎使用阅读，这是手机 MNN 本地合成测试。") }
+    var flowBackend by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceRuntime.detectBestFlowBackend()) }
     var flowGpuMode by androidx.compose.runtime.remember { mutableIntStateOf(68) }
     var hiftBackend by androidx.compose.runtime.remember { mutableStateOf("cpu") }
     var hiftGpuMode by androidx.compose.runtime.remember { mutableIntStateOf(4) }
@@ -424,8 +425,15 @@ private fun CosyVoiceManagerScreen(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("GPU 调度", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                    Text("Flow OpenCL mode", fontSize = 13.sp)
-                    ModeButtons(flowGpuMode, busyMessage.isBlank()) { flowGpuMode = it }
+                    Text("Flow 后端", fontSize = 13.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ChoiceButton("CPU", flowBackend == "cpu", busyMessage.isBlank()) { flowBackend = "cpu" }
+                        ChoiceButton("OpenCL", flowBackend == "opencl", busyMessage.isBlank()) { flowBackend = "opencl" }
+                    }
+                    if (flowBackend == "opencl") {
+                        Text("Flow OpenCL mode", fontSize = 13.sp)
+                        ModeButtons(flowGpuMode, busyMessage.isBlank()) { flowGpuMode = it }
+                    }
                     Text("HiFT core", fontSize = 13.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         ChoiceButton("CPU", hiftBackend == "cpu", busyMessage.isBlank()) { hiftBackend = "cpu" }
@@ -513,7 +521,7 @@ private fun CosyVoiceManagerScreen(
 
                     OutlinedTextField(previewText, { previewText = it }, label = { Text("试听文字") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                     Button(
-                        onClick = { onPreview(previewText, CosyVoiceSynthesisOptions(flowGpuMode = flowGpuMode, hiftCoreBackend = hiftBackend, hiftGpuMode = hiftGpuMode, voiceProfileId = selectedVoiceProfileId, inferenceMode = inferenceMode, instruction = instruction)) },
+                        onClick = { onPreview(previewText, CosyVoiceSynthesisOptions(flowBackend = flowBackend, flowGpuMode = flowGpuMode, hiftCoreBackend = hiftBackend, hiftGpuMode = hiftGpuMode, voiceProfileId = selectedVoiceProfileId, inferenceMode = inferenceMode, instruction = instruction)) },
                         enabled = busyMessage.isBlank() && modelStatus.ready && (inferenceMode != CosyVoiceInferenceMode.INSTRUCT2 || instruction.isNotBlank()),
                         modifier = Modifier.fillMaxWidth()) { Text("合成并试听") }
                 }

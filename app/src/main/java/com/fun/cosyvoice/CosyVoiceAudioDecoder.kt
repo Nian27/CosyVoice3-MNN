@@ -1,4 +1,4 @@
-package com.fun.cosyvoice
+package com.cosyvoice.app
 
 import android.content.Context
 import android.media.AudioFormat
