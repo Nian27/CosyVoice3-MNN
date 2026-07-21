@@ -38,10 +38,12 @@
 **这个独立 App 的目标**：
 
 - ✅ 去掉所有阅读 App 的业务代码，只保留 CosyVoice3 合成和音色管理
-- ✅ 添加 CPU / OpenCL 双后端自动检测，非高通手机也能用 CPU 合成
+- ✅ 去掉所有阅读 App 的业务代码，只保留 CosyVoice3 合成和音色管理
+- ✅ 添加 CPU / OpenCL 双后端自动检测
 - ✅ 提供完整的 ZIP 导入/导出模型系统和音色档案管理
 - ✅ 保留手机创建音色（Enrollment）功能
-- ✅ 开源便于其他人定位问题、提交修改
+- ✅ 开源，欢迎大家一起来修
+- ⚠️ **注意**：非高通设备能否用 CPU 合成还需要实测验证
 
 ---
 
@@ -84,7 +86,7 @@
 | `libcosy_llm_jni.so` | 6.9 MB | LLM 推理：从文字生成语音 Token（CPU 4 线程） |
 | `libcosy_flow_jni.so` | 6.9 MB | Flow 模型：Token → Mel 频谱（支持 CPU/OpenCL） |
 | `libcosy_hift_jni.so` | 7.0 MB | HiFT 模型：Mel → WAV 波形（支持 CPU/OpenCL） |
-| `libcosy_enrollment_jni.so` | 7.0 MB | 音色注册（可选扩展，约 490 MB 模型） |
+| `libcosy_enrollment_jni.so` | 7.0 MB | 音色注册（可选扩展，约 974 MB 模型） |
 | `libcosy_conditioner_exec.so` | 4.9 MB | Conditioner 预处理（独立子进程） |
 
 ---
@@ -165,19 +167,20 @@
 
 ---
 
-## 已修复的问题清单
+## 问题记录（供后续开发者参考）
 
-以下是开发过程中遇到并解决的所有问题，供遇到类似问题的开发者参考：
+> ⚠️ 以下 fix **只在我的手机（骁龙 8 Gen 3）上测试过**。非高通手机能否正常工作**还不确定**，欢迎有麒麟/天玑设备的朋友帮忙验证并提交反馈。
 
-### 1. 非高通手机 OpenCL 闪退
+### 1. 非高通手机 OpenCL 闪退（不确定是否完全解决）
 
 **症状**：华为麒麟 / 联发科天玑手机安装后闪退，Logcat 看到 `libOpenCL.so not found`
 
 **根因**：AndroidManifest.xml 中 `<uses-native-library android:name="libOpenCL.so" android:required="true"/>` — 只有 Qualcomm Adreno GPU 有这个库
 
-**修复（2 处改动）**：
+**尝试的修复（2 处改动，未在非高通设备上实测）**：
 - Manifest: `required="true"` → `required="false"`，这样系统不会因为缺少 OpenCL 拒绝安装
 - 运行时检测：`CosyVoiceRuntime.detectBestFlowBackend()` 用 `System.loadLibrary("OpenCL")` 检测，没有就降级到 CPU
+- **但我无法确认 Flow CPU 的 libcosy_flow_jni.so 是否真的能在非高通设备上运行**
 
 关联代码：`CosyVoiceRuntime.kt:71-82` → `detectBestFlowBackend()`
 
@@ -257,7 +260,7 @@ packaging {
 | 架构 | arm64-v8a 处理器 |
 | RAM | 推荐 8 GB+（合成时占用 ~1 GB） |
 | **存储（模型）** | **至少 1.4 GB**（模型包 ~1.3 GB + 运行时临时文件） |
-| **存储（创建音色）** | **额外 490 MB**（可选扩展，不安装不影响合成） |
+| **存储（创建音色）** | **额外 ~974 MB**（可选扩展，不安装不影响合成） |
 | GPU（可选） | 任何 OpenCL 支持的 GPU（Adreno / Mali / PowerVR） |
 
 ---
@@ -285,7 +288,7 @@ adb install -r app-debug.apk
 | 文件 | 大小 | 说明 |
 |------|------|------|
 | `cosyvoice3-mnn-mobile-fp16-complete.zip` | ~1.3 GB | 完整 MNN 模型包（17 个文件） |
-| `cosyvoice3-mnn-enrollment-extension.zip` | ~490 MB | 音色创建扩展（可选，如需手机创建音色） |
+| `cosyvoice3-mnn-enrollment-extension.zip` | ~974 MB | 音色创建扩展（可选，如需手机创建音色） |
 
 ### 4. 导入模型
 
@@ -385,7 +388,7 @@ rand-noise.bin（symlink） # 符号链接到模型目录的共享噪声
 
 ## 手机创建音色
 
-需要先导入"音色创建扩展"（~490 MB）。
+需要先导入"音色创建扩展"（~974 MB）。
 
 ### 流程
 
@@ -562,7 +565,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ### Q：音色创建失败
 
-1. 确认已导入音色创建扩展（~490 MB）
+1. 确认已导入音色创建扩展（~974 MB）
 2. 确保截取 3-5 秒清晰单人语音
 3. 确保填写的文字与音频内容一致
 4. 查看 Logcat 中的错误码（见上面"常见错误码"表格）
@@ -609,6 +612,36 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | CAM++ Speaker | MNN | ~27 MB | Apache 2.0 | [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) |
 
 模型下载链接：**[GitHub Releases 页面](https://github.com/Nian27/Fun-CosyVoice/releases)**
+
+---
+
+## 欢迎参与
+
+**目前这个项目只在我的一台骁龙 8 Gen 3 手机上测试通过**。非高通设备（麒麟/天玑/Exynos）能不能跑、跑得怎么样，都需要大家帮忙验证。
+
+### 你可以做什么
+
+| 角色 | 能做 |
+|------|------|
+| **有非高通手机的人** | 安装 APK 试试能不能用，[提 Issue](https://github.com/Nian27/Fun-CosyVoice/issues/new) 告诉我结果 |
+| **Android 开发者** | 修 Bug、优化性能、加功能，直接提 Pull Request |
+| **对 TTS 感兴趣的人** | 读代码、提建议、分享你创建的音色档案 |
+| **任何用户** | 用用看，不好用就骂，骂完记得告诉我哪里不好 |
+
+### 我知道的问题（还没修）
+
+1. **非高通 Flow CPU 兼容性**：我没麒麟/天玑设备，`libcosy_flow_jni.so` 的 CPU 后端能不能用**完全没有验证**
+2. **首次加载慢**：冷态首次合成 GPU 需要编译 kernel，等待 10-15 秒是正常的
+3. **没有国际化**：UI 只有中文
+4. **APK 没有签名**：debug APK 直接安装，部分系统会提示"未知来源"
+
+### 贡献方式
+
+1. Fork 本仓库
+2. 创建特性分支（`git checkout -b feature/my-fix`）
+3. 提交修改（`git commit -am 'fix: xxx'`）
+4. 推送到分支（`git push origin feature/my-fix`）
+5. 创建 Pull Request
 
 ---
 
