@@ -11,7 +11,7 @@
 - [项目背景：为什么要做这个](#项目背景为什么要做这个)
 - [整体架构](#整体架构)
 - [合成管线详解（4 个阶段）](#合成管线详解4-个阶段)
-- [已修复的问题清单](#已修复的问题清单)
+- [问题记录（供后续开发者参考）](#问题记录供后续开发者参考)
 - [性能数据（BKQ_AN90 真机实测）](#性能数据bkq_an90-真机实测)
 - [系统要求](#系统要求)
 - [快速开始](#快速开始)
@@ -23,6 +23,8 @@
 - [从源码构建](#从源码构建)
 - [常见问题 / Troubleshooting](#常见问题--troubleshooting)
 - [技术栈](#技术栈)
+- [模型信息](#模型信息)
+- [欢迎参与](#欢迎参与)
 - [许可证](#许可证)
 
 ---
@@ -37,7 +39,6 @@
 
 **这个独立 App 的目标**：
 
-- ✅ 去掉所有阅读 App 的业务代码，只保留 CosyVoice3 合成和音色管理
 - ✅ 去掉所有阅读 App 的业务代码，只保留 CosyVoice3 合成和音色管理
 - ✅ 添加 CPU / OpenCL 双后端自动检测
 - ✅ 提供完整的 ZIP 导入/导出模型系统和音色档案管理
@@ -178,7 +179,7 @@
 **根因**：AndroidManifest.xml 中 `<uses-native-library android:name="libOpenCL.so" android:required="true"/>` — 只有 Qualcomm Adreno GPU 有这个库
 
 **尝试的修复（2 处改动，未在非高通设备上实测）**：
-- Manifest: `required="true"` → `required="false"`，这样系统不会因为缺少 OpenCL 拒绝安装
+- 原本 cosytest 的 Manifest 有 `required="true"`，独立 App 新建 Manifest 时直接没加这一行
 - 运行时检测：`CosyVoiceRuntime.detectBestFlowBackend()` 用 `System.loadLibrary("OpenCL")` 检测，没有就降级到 CPU
 - **但我无法确认 Flow CPU 的 libcosy_flow_jni.so 是否真的能在非高通设备上运行**
 
@@ -198,14 +199,9 @@
 
 **症状**：`System.loadLibrary("cosy_llm_jni")` 抛 `UnsatisfiedLinkError`
 
-**根因**：Android 12+ 默认不提取原生库，而 jniLibs 中的 .so 需要通过 JNI 加载
+**根因**：原本 cosytest 的 Android 12+ 设备上 `extractNativeLibs=false`，.so 未被提取到 native lib 目录
 
-**修复**：在 `app/build.gradle.kts` 中添加：
-```kotlin
-packaging {
-    jniLibs.useLegacyPackaging = true
-}
-```
+**修复**：在 cosytest 的 `app/build.gradle.kts` 中添加了 `jniLibs.useLegacyPackaging = true`。独立 App 也已加上此配置。
 
 ### 4. 首次打开 App 空指针崩溃
 
