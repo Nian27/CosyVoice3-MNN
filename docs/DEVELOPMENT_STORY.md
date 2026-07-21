@@ -304,7 +304,7 @@ research/mnn-cosyvoice3/
 
 ## 8. 性能数据汇总
 
-### 端到端（荣耀 Magic8 Pro / SM8850 / Adreno 840 / 12 GB RAM）
+### 端到端（荣耀 Magic8 Pro / SM8850 第五代骁龙8至尊版 / Adreno 830 / 12 GB RAM）
 
 | 配置 | 冷启动 | 热态 |
 |------|--------|------|
