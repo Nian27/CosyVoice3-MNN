@@ -13,6 +13,7 @@
 - [项目背景](#项目背景)
 - [整体架构](#整体架构)
 - [合成管线详解（4 个阶段）](#合成管线详解4-个阶段)
+- [移植过程](#移植过程)
 - [问题记录（供后续开发者参考）](#问题记录供后续开发者参考)
 - [性能数据（荣耀 Magic8 Pro 真机实测）](#性能数据荣耀-magic8-pro-真机实测)
 - [系统要求](#系统要求)
@@ -36,6 +37,20 @@
 **起因**：想要一个音色好的本地 TTS 模型，不用联网，不用调 API。CosyVoice3 音质不错但官方只有 Python 版本。于是搞了这台移植——PyTorch → ONNX → MNN → Android arm64 .so，中间踩了 Vulkan DeviceLost、FP16 溢出、Flow 蒸馏一堆坑。
 
 **本来没打算发**，就是自己用。后来觉得折腾了这么久，代码放着也是放着，不如开源出来，万一有人也想在手机上跑本地 TTS 能少走点弯路。
+
+### 移植过程
+
+从 PyTorch 到手机上能跑，大概经历了这些：
+
+1. **CrispASR/ggml + Vulkan** → Adreno GPU 报 `ErrorDeviceLost`，废弃
+2. **换 MNN/OpenCL** → PyTorch 导出 ONNX → MNN 转换 → 但 10 步 Flow 跑一次 18 秒，没法用
+3. **ONNX 稳定性修复** → FP16 精度下 Softplus 溢出、GELU 溢出，重写了激活函数
+4. **CFG 单分支蒸馏** → 把双分支 CFG 教师蒸馏成单分支学生，batch=2→1，单步 1.84 秒→0.91 秒
+5. **两步宏轨迹蒸馏** → 10 步 Euler solver → 2 步，最终两步仅 2.37 秒，mel 余弦 0.9988
+6. **JNI 集成** → Conditioner/LLM/Flow/HiFT 从子进程迁到 App 内常驻 JNI，修复 OpenCL 子进程不能继承的问题
+7. **手机调优** → Flow 桶机制避免 GPU kernel 重编译、HiFT CPU 6 线程、Buffer mode 68
+
+详细过程见 [`docs/DEVELOPMENT_STORY.md`](docs/DEVELOPMENT_STORY.md)，所有可复现脚本在 [`research/mnn-cosyvoice3/`](research/mnn-cosyvoice3/)。
 
 ---
 
