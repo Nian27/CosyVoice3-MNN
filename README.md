@@ -1,4 +1,4 @@
-# Fun-CosyVoice
+# CosyVoice3-MNN
 
 **CosyVoice3 MNN 手机端本地语音合成 — 纯 Android arm64 独立应用**
 
@@ -265,7 +265,7 @@
 
 ### 1. 下载 APK
 
-从 [GitHub Releases](https://github.com/Nian27/Fun-CosyVoice/releases) 下载最新的 `app-debug.apk`
+从 [GitHub Releases](https://github.com/Nian27/CosyVoice3-MNN/releases) 下载最新的 `app-debug.apk`
 
 ```bash
 # 或者自己构建（见"从源码构建"章节）
@@ -513,8 +513,8 @@ Fun-CosyVoice/
 
 ```bash
 # 1. 克隆
-git clone https://github.com/Nian27/Fun-CosyVoice.git
-cd Fun-CosyVoice
+git clone https://github.com/Nian27/CosyVoice3-MNN.git
+cd CosyVoice3-MNN
 
 # 2. 构建 Debug APK
 ./gradlew :app:assembleDebug
@@ -613,7 +613,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | Speech Tokenizer v3 | MNN | ~924 MB | Apache 2.0 | [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) |
 | CAM++ Speaker | MNN | ~27 MB | Apache 2.0 | [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) |
 
-模型下载链接：**[GitHub Releases 页面](https://github.com/Nian27/Fun-CosyVoice/releases)**
+模型下载链接：**[GitHub Releases 页面](https://github.com/Nian27/CosyVoice3-MNN/releases)**
 
 ---
 
@@ -625,7 +625,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 | 角色 | 能做 |
 |------|------|
-| **有非高通手机的人** | 安装 APK 试试能不能用，[提 Issue](https://github.com/Nian27/Fun-CosyVoice/issues/new) 告诉我结果 |
+| **有非高通手机的人** | 安装 APK 试试能不能用，[提 Issue](https://github.com/Nian27/CosyVoice3-MNN/issues/new) 告诉我结果 |
 | **Android 开发者** | 修 Bug、优化性能、加功能，直接提 Pull Request |
 | **对 TTS 感兴趣的人** | 读代码、提建议、分享你创建的音色档案 |
 | **任何用户** | 用用看，不好用就骂，骂完记得告诉我哪里不好 |
@@ -662,11 +662,11 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 - [alibaba/MNN](https://github.com/alibaba/MNN) — 阿里巴巴 MNN 推理引擎
 - [CrispASR/mnn-cosyvoice-jni](https://github.com/crisp-oss/mnn-cosyvoice-jni) — MNN CosyVoice JNI 绑定
 - [gedoor/Legado](https://github.com/gedoor/Legado) — 阅读 Archive，本项目的来源
-- 所有在 [Issues](https://github.com/Nian27/Fun-CosyVoice/issues) 中反馈问题、提交代码的贡献者
+- 所有在 [Issues](https://github.com/Nian27/CosyVoice3-MNN/issues) 中反馈问题、提交代码的贡献者
 
 ---
 
-> **遇到问题？** → [提交 Issue](https://github.com/Nian27/Fun-CosyVoice/issues/new)
+> **遇到问题？** → [提交 Issue](https://github.com/Nian27/CosyVoice3-MNN/issues/new)
 >
 > 提交时请附上：
 > - 手机型号 / Android 版本

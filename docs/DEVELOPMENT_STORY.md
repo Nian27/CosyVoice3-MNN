@@ -1,4 +1,4 @@
-# Fun-CosyVoice 开发全流程记录
+# CosyVoice3-MNN 开发全流程记录
 
 > 从 Legado Archive 提取 CosyVoice3 本地 TTS 为独立 App 的完整过程。
 >
@@ -409,4 +409,4 @@ research/mnn-cosyvoice3/
 >
 > **完整研究目录**：`research/mnn-cosyvoice3/`（包含所有可复现脚本）
 >
-> **反馈**：[GitHub Issues](https://github.com/Nian27/Fun-CosyVoice/issues)
+> **反馈**：[GitHub Issues](https://github.com/Nian27/CosyVoice3-MNN/issues)

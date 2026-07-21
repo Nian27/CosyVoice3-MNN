@@ -400,7 +400,7 @@ private fun CosyVoiceManagerScreen(
         Surface(shadowElevation = 2.dp) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onBack) { Text("返回") }
-                Text("Fun-CosyVoice 真机测试", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("CosyVoice3-MNN 真机测试", fontSize = 20.sp, fontWeight = FontWeight.Bold)
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {

@@ -18,5 +18,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Fun-CosyVoice"
+rootProject.name = "CosyVoice3-MNN"
 include(":app")
