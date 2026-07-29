@@ -105,6 +105,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CosyVoiceRuntime.initialize(this)
         selectedVoiceProfileId = store.selectedVoiceProfileId()
         refresh()
         setContentView(ComposeView(this).apply {
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
                     modelStatus, enrollmentStatus, voiceProfiles, selectedVoiceProfileId,
                     selectedAudioName, busyMessage, resultMessage,
                     onBack = { finish() },
+                    onDownloadModel = { downloadModel() },
                     onImportModel = { modelZipLauncher.launch(arrayOf("application/zip", "application/octet-stream")) },
                     onExportModel = { modelExportLauncher.launch("cosyvoice3-mnn-complete.zip") },
                     onDeleteModel = { deleteModel() },
@@ -298,6 +300,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun downloadModel() {
+        if (busyMessage.isNotBlank()) return
+        scope.launch {
+            busyMessage = "正在准备 Hugging Face 模型下载"
+            resultMessage = ""
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    CosyVoiceModelDownloader(this@MainActivity, store).download(
+                        onProgress = { progress ->
+                            scope.launch {
+                                busyMessage =
+                                    "正在下载模型 ${progress.percent}% · ${formatBytes(progress.totalBytes)} / ${formatBytes(progress.totalExpectedBytes)}"
+                            }
+                        },
+                        onStage = { stage -> scope.launch { busyMessage = stage } }
+                    )
+                }
+            }.onSuccess {
+                refresh()
+                resultMessage = "MNN 模型在线安装完成"
+            }.onFailure {
+                resultMessage = "模型下载失败：${it.localizedMessage.orEmpty()}"
+                Log.e("CosyVoice", "model download failed", it)
+            }
+            busyMessage = ""
+        }
+    }
+
     private fun preview(text: String, options: CosyVoiceSynthesisOptions) {
         if (busyMessage.isNotBlank()) return
         if (!modelStatus.ready) { resultMessage = "请先导入完整 MNN 模型包"; return }
@@ -375,7 +405,8 @@ private fun CosyVoiceManagerScreen(
     modelStatus: CosyVoiceModelStatus, enrollmentStatus: CosyVoiceModelStatus,
     voiceProfiles: List<CosyVoiceVoiceProfile>, selectedVoiceProfileId: String,
     selectedAudioName: String, busyMessage: String, resultMessage: String,
-    onBack: () -> Unit, onImportModel: () -> Unit, onExportModel: () -> Unit, onDeleteModel: () -> Unit,
+    onBack: () -> Unit, onDownloadModel: () -> Unit, onImportModel: () -> Unit,
+    onExportModel: () -> Unit, onDeleteModel: () -> Unit,
     onImportVoiceProfile: () -> Unit, onExportVoiceProfile: (CosyVoiceVoiceProfile) -> Unit,
     onExportAllVoiceProfiles: () -> Unit, onVoiceProfileSelected: (String) -> Unit,
     onCreateRealtimeVoiceProfile: (CosyVoiceVoiceProfile) -> Unit, onDeleteVoiceProfile: (CosyVoiceVoiceProfile) -> Unit,
@@ -384,10 +415,7 @@ private fun CosyVoiceManagerScreen(
     onPreview: (String, CosyVoiceSynthesisOptions) -> Unit
 ) {
     var previewText by androidx.compose.runtime.remember { mutableStateOf("你好，欢迎使用阅读，这是手机 MNN 本地合成测试。") }
-    var flowBackend by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceRuntime.detectBestFlowBackend()) }
-    var flowGpuMode by androidx.compose.runtime.remember { mutableIntStateOf(68) }
-    var hiftBackend by androidx.compose.runtime.remember { mutableStateOf("cpu") }
-    var hiftGpuMode by androidx.compose.runtime.remember { mutableIntStateOf(4) }
+    val hardwarePlan = CosyVoiceRuntime.recommendedHardwarePlan()
     var inferenceMode by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceInferenceMode.ZERO_SHOT) }
     var instruction by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceInstruction.DEFAULT_INSTRUCTION) }
     var voiceName by androidx.compose.runtime.remember { mutableStateOf("") }
@@ -400,7 +428,7 @@ private fun CosyVoiceManagerScreen(
         Surface(shadowElevation = 2.dp) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onBack) { Text("返回") }
-                Text("CosyVoice3-MNN 真机测试", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("CosyVoice3-MNN", fontSize = 20.sp, fontWeight = FontWeight.Bold)
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -414,6 +442,9 @@ private fun CosyVoiceManagerScreen(
                         color = if (modelStatus.ready) Color(0xFF228B22) else MaterialTheme.colorScheme.error)
                     if (modelStatus.missingFiles.isNotEmpty()) Text(modelStatus.missingFiles.joinToString("\n"), fontSize = 12.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = onDownloadModel, enabled = busyMessage.isBlank()) {
+                            Text("在线安装")
+                        }
                         Button(onClick = onImportModel, enabled = busyMessage.isBlank()) { Text("导入 ZIP") }
                         OutlinedButton(onClick = onExportModel, enabled = busyMessage.isBlank() && modelStatus.ready) { Text("导出 ZIP") }
                     }
@@ -421,25 +452,16 @@ private fun CosyVoiceManagerScreen(
                 }
             }
 
-            // --- GPU Scheduling Card ---
+            // --- Automatic Hardware Scheduling Card ---
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("GPU 调度", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                    Text("Flow 后端", fontSize = 13.sp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        ChoiceButton("CPU", flowBackend == "cpu", busyMessage.isBlank()) { flowBackend = "cpu" }
-                        ChoiceButton("OpenCL", flowBackend == "opencl", busyMessage.isBlank()) { flowBackend = "opencl" }
-                    }
-                    if (flowBackend == "opencl") {
-                        Text("Flow OpenCL mode", fontSize = 13.sp)
-                        ModeButtons(flowGpuMode, busyMessage.isBlank()) { flowGpuMode = it }
-                    }
-                    Text("HiFT core", fontSize = 13.sp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        ChoiceButton("CPU", hiftBackend == "cpu", busyMessage.isBlank()) { hiftBackend = "cpu" }
-                        ChoiceButton("GPU", hiftBackend == "opencl", busyMessage.isBlank()) { hiftBackend = "opencl" }
-                    }
-                    if (hiftBackend == "opencl") { Text("HiFT OpenCL mode", fontSize = 13.sp); ModeButtons(hiftGpuMode, busyMessage.isBlank()) { hiftGpuMode = it } }
+                    Text("自动硬件调度", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                    Text(hardwarePlan.summary(), fontSize = 13.sp)
+                    Text(hardwarePlan.npuStatus, fontSize = 12.sp)
+                    Text(
+                        "后端由机型验证结果自动选择；NPU 输出异常会整句回退 CPU。",
+                        fontSize = 12.sp
+                    )
                 }
             }
 
@@ -521,7 +543,17 @@ private fun CosyVoiceManagerScreen(
 
                     OutlinedTextField(previewText, { previewText = it }, label = { Text("试听文字") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                     Button(
-                        onClick = { onPreview(previewText, CosyVoiceSynthesisOptions(flowBackend = flowBackend, flowGpuMode = flowGpuMode, hiftCoreBackend = hiftBackend, hiftGpuMode = hiftGpuMode, voiceProfileId = selectedVoiceProfileId, inferenceMode = inferenceMode, instruction = instruction)) },
+                        onClick = {
+                            onPreview(
+                                previewText,
+                                CosyVoiceSynthesisOptions(
+                                    hardwarePlan = hardwarePlan,
+                                    voiceProfileId = selectedVoiceProfileId,
+                                    inferenceMode = inferenceMode,
+                                    instruction = instruction
+                                )
+                            )
+                        },
                         enabled = busyMessage.isBlank() && modelStatus.ready && (inferenceMode != CosyVoiceInferenceMode.INSTRUCT2 || instruction.isNotBlank()),
                         modifier = Modifier.fillMaxWidth()) { Text("合成并试听") }
                 }

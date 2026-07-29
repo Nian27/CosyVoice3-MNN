@@ -44,9 +44,11 @@ list(APPEND MNN_CPP_TOOLS CosyVoiceHiFTPersistentBenchmark.out)
 
 if (MNN_BUILD_LLM)
     add_executable(CosyVoiceLlmBenchmark.out ${CMAKE_CURRENT_LIST_DIR}/CosyVoiceLlmBenchmark.cpp)
+    target_link_libraries(CosyVoiceLlmBenchmark.out llm)
     list(APPEND MNN_CPP_TOOLS CosyVoiceLlmBenchmark.out)
 
     add_executable(CosyVoiceLlmPersistentBenchmark.out ${CMAKE_CURRENT_LIST_DIR}/CosyVoiceLlmPersistentBenchmark.cpp)
+    target_link_libraries(CosyVoiceLlmPersistentBenchmark.out llm)
     list(APPEND MNN_CPP_TOOLS CosyVoiceLlmPersistentBenchmark.out)
 
     if (ANDROID)

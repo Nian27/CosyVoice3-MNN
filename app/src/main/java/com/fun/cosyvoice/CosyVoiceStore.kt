@@ -7,6 +7,7 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.security.MessageDigest
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
@@ -406,24 +407,30 @@ class CosyVoiceStore(context: Context) {
     }
 
     fun importModelZip(uri: Uri, onProgress: (String) -> Unit = {}) {
+        appContext.contentResolver.openInputStream(uri)?.use { input ->
+            importModelZip(input, onProgress)
+        } ?: error("无法读取模型包")
+    }
+
+    fun importModelZip(input: InputStream, onProgress: (String) -> Unit = {}) {
         val staging = File(root, "model-staging-${System.currentTimeMillis()}").apply { mkdirs() }
         val accepted = mutableSetOf<String>()
         try {
-            appContext.contentResolver.openInputStream(uri)?.use { input ->
-                ZipInputStream(input.buffered()).use { zip ->
-                    while (true) {
-                        val entry = zip.nextEntry ?: break
-                        if (entry.isDirectory) continue
-                        val name = File(entry.name.replace('\\', '/')).name
-                        val spec = MODEL_FILE_SPECS.firstOrNull { it.name == name } ?: continue
-                        onProgress("正在导入 $name")
-                        val target = File(staging, name)
-                        FileOutputStream(target).buffered().use { output -> zip.copyTo(output, 1024 * 1024) }
-                        verifyModelFile(target, spec, checkHash = true)
-                        accepted += name
+            ZipInputStream(input.buffered()).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    if (entry.isDirectory) continue
+                    val name = File(entry.name.replace('\\', '/')).name
+                    val spec = MODEL_FILE_SPECS.firstOrNull { it.name == name } ?: continue
+                    onProgress("正在导入 $name")
+                    val target = File(staging, name)
+                    FileOutputStream(target).buffered().use { output ->
+                        zip.copyTo(output, 1024 * 1024)
                     }
+                    verifyModelFile(target, spec, checkHash = true)
+                    accepted += name
                 }
-            } ?: error("无法读取模型包")
+            }
             val missing = REQUIRED_MODEL_FILES - accepted
             check(missing.isEmpty()) { "模型包缺少：${missing.joinToString()}" }
             MODEL_FILE_SPECS.forEach { spec ->
@@ -472,11 +479,16 @@ class CosyVoiceStore(context: Context) {
         }
     }
 
-    fun llmRuntimeConfig(): File {
+    fun llmRuntimeConfig(backend: String = "cpu"): File {
+        require(backend in setOf("cpu", "hexagon")) { "不支持的 LLM 后端：$backend" }
         val source = modelFile("config-cpu-cosyvoice-ras.json")
         check(source.isFile) { "缺少 LLM 配置文件" }
-        val target = File(modelDir, "config-cpu-cosyvoice-ras-runtime.json")
-        val content = JSONObject(source.readText(Charsets.UTF_8)).put("thread_num", 4).put("power", "high").toString(2)
+        val target = File(modelDir, "config-$backend-cosyvoice-ras-runtime.json")
+        val content = JSONObject(source.readText(Charsets.UTF_8))
+            .put("backend_type", backend)
+            .put("thread_num", 4)
+            .put("power", "high")
+            .toString(2)
         if (!target.isFile || target.readText(Charsets.UTF_8) != content) target.writeText(content, Charsets.UTF_8)
         return target
     }
@@ -486,6 +498,7 @@ class CosyVoiceStore(context: Context) {
             modelFile(spec).delete(); modelPartFile(spec).delete(); modelVerifiedFile(spec).delete()
         }
         File(modelDir, "config-cpu-cosyvoice-ras-runtime.json").delete()
+        File(modelDir, "config-hexagon-cosyvoice-ras-runtime.json").delete()
         gpuCacheDir.listFiles()?.forEach(File::delete)
         Log.i(TAG, "model deleted")
     }

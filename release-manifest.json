@@ -1,0 +1,37 @@
+{
+  "release": "v1.1.0",
+  "versionCode": 2,
+  "applicationId": "com.cosyvoice.app",
+  "mnnVersion": "3.6.1",
+  "androidAbi": "arm64-v8a",
+  "apk": {
+    "name": "CosyVoice3-MNN-v1.1.0-arm64.apk",
+    "bytes": 27795217,
+    "sha256": "A25D6E0822F000724E6E8599B6D28EC791ECCCEE9162CBF76FF7EF2E088EC996"
+  },
+  "models": [
+    {
+      "name": "cosyvoice3-mnn-mobile-fp16-complete.zip",
+      "bytes": 1399083563,
+      "sha256": "B1C74DFC90972D82D8166813620A882FE37A0DC02964E19C4F33DAAFEFEB1C84",
+      "required": true,
+      "url": "https://huggingface.co/VicenTrent/Cosy-Voice-MNN/resolve/main/cosyvoice3-mnn-mobile-fp16-complete.zip?download=true"
+    },
+    {
+      "name": "cosyvoice3-mnn-enrollment-extension.zip",
+      "bytes": 997807778,
+      "sha256": "59EF5C8810D3CEAD01FF21A64379CF0A819F0A72651A6BA2B2343E9DA5A72231",
+      "required": false,
+      "url": "https://huggingface.co/VicenTrent/Cosy-Voice-MNN/resolve/main/cosyvoice3-mnn-enrollment-extension.zip?download=true"
+    }
+  ],
+  "verifiedNpu": {
+    "socModels": [
+      "SM8850"
+    ],
+    "operator": "/layers.0/self_attn/q_proj/Linear",
+    "llmWallP50CpuMs": 1598.23,
+    "llmWallP50NpuMs": 1503.35,
+    "speedupPercent": 5.94
+  }
+}

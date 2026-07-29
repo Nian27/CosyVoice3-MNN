@@ -1,10 +1,12 @@
 # CosyVoice3-MNN
 
-**CosyVoice3 MNN 手机端本地语音合成 — 纯 Android arm64 独立应用**
-
-> 本次发布由 DeepSeek V4 Pro 负责。有啥问题怪他不发正式版。
+**CosyVoice3 MNN 手机端本地语音合成 — Android arm64 正式版**
 
 CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本地运行，无需联网。
+
+> v1.1.0 使用 MNN 3.6.1。在已验证的 SM8850 上自动启用
+> `第 0 层 q_proj NPU + 其余 LLM CPU`；其他设备自动使用 CPU/OpenCL 兼容路径。
+> 整模型 NPU 会导致 Token 坍缩和错误声音，本项目不会默认启用。
 
 ---
 
@@ -59,7 +61,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     MainActivity (Compose UI)             │
-│  模型管理 │ 音色选择 │ GPU调度 │ 试听 │ 创建音色 │ 下载    │
+│  模型管理 │ 音色选择 │ 自动硬件调度 │ 试听 │ 创建音色 │ 下载 │
 └───────────────┬─────────────────────────┬───────────────┘
                 │                         │
                 ▼                         ▼
@@ -76,7 +78,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 │ (libcosy_llm_jni) │   │ (libcosy_flow_jni)   │   │ (libcosy_hift_jni)  │
 ├───────────────────┤   ├─────────────────────┤   ├─────────────────────┤
 │ MNN LLM           │   │ MNN Flow            │   │ MNN HiFT            │
-│ CPU 推理          │   │ CPU/OpenCL 推理      │   │ CPU/OpenCL 推理     │
+│ CPU / q_proj NPU  │   │ CPU/OpenCL 推理      │   │ CPU 推理            │
 │ 生成语音 Token     │   │ Token → Mel 频谱     │   │ Mel → WAV 波形      │
 └───────────────────┘   └─────────────────────┘   └─────────────────────┘
                                                  ┌──────────────────────┐
@@ -86,15 +88,18 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
                                                  └──────────────────────┘
 ```
 
-**5 个原生 .so 文件**（`app/src/main/jniLibs/arm64-v8a/`，共 32.7 MB）：
+原生运行库动态链接 MNN 3.6.1，并包含 Hexagon Stub；DSP Skeleton 位于
+`app/src/main/assets/hexagon/`。完整构建与验证边界见
+[`docs/NPU_RELEASE_VALIDATION.md`](docs/NPU_RELEASE_VALIDATION.md)。
 
 | 文件 | 大小 | 功能 |
 |------|------|------|
-| `libcosy_llm_jni.so` | 6.9 MB | LLM 推理：从文字生成语音 Token（CPU 4 线程） |
-| `libcosy_flow_jni.so` | 6.9 MB | Flow 模型：Token → Mel 频谱（支持 CPU/OpenCL） |
-| `libcosy_hift_jni.so` | 7.0 MB | HiFT 模型：Mel → WAV 波形（支持 CPU/OpenCL） |
-| `libcosy_enrollment_jni.so` | 7.0 MB | 音色注册（可选扩展，约 974 MB 模型） |
-| `libcosy_conditioner_exec.so` | 4.9 MB | Conditioner 预处理（独立子进程） |
+| `libMNN.so` / `libllm.so` | 动态运行库 | MNN 3.6.1 与 LLM |
+| `libMNN_htpops.so` | Hexagon Stub | 与 DSP Skeleton 配合调用 NPU |
+| `libcosy_llm_jni.so` | JNI | LLM CPU / 受限 q_proj NPU |
+| `libcosy_flow_jni.so` | JNI | Flow CPU/OpenCL |
+| `libcosy_hift_jni.so` | JNI | HiFT CPU |
+| `libcosy_enrollment_jni.so` | JNI | 音色注册 |
 
 ---
 
@@ -111,7 +116,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
     [prompt-speech-tokens.csv]  ← 当前选中音色的参考 Token（零样本复刻才有）
         │
         ▼
-    LLM (libcosy_llm_jni / CPU 4线程 / llm.mnn + llm.mnn.weight ~336 MB)
+    LLM (SM8850: q_proj NPU + CPU；其他设备: CPU)
         │
         ▼
 输出: speech-tokens-0.csv  ← 一串数字，每个 0~6560 表示一个语音码本索引
@@ -119,7 +124,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 
 - 耗时：约 1.5~2.0 秒
 - 如果是"指令演绎"（Instruct2）模式，不附加参考 Token，用指令文字替代
-- LLM 是标准的 Transformer 结构，MNN 跑在 CPU 上
+- SM8850 仅将 `/layers.0/self_attn/q_proj/Linear` 放到 Hexagon；质量门失败会整句回退 CPU
 
 ### 阶段 2：Conditioner — Token 预处理
 
@@ -271,7 +276,8 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 
 ### 1. 下载 APK
 
-从 [GitHub Releases](https://github.com/Nian27/CosyVoice3-MNN/releases) 下载最新的 `app-debug.apk`
+从 [GitHub Releases](https://github.com/Nian27/CosyVoice3-MNN/releases) 下载最新的
+`CosyVoice3-MNN-v1.1.0-arm64.apk`。
 
 ```bash
 # 或者自己构建（见"从源码构建"章节）
@@ -280,16 +286,18 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 ### 2. 安装 APK
 
 ```bash
-adb install -r app-debug.apk
+adb install -r CosyVoice3-MNN-v1.1.0-arm64.apk
 ```
 
 ### 3. 下载模型
 
-两个必需的文件（从 GitHub Releases 下载）：
+完整模型和可选音色扩展托管在
+[Hugging Face：VicenTrent/Cosy-Voice-MNN](https://huggingface.co/VicenTrent/Cosy-Voice-MNN)。
+App 可点击“在线安装”断点续传并校验完整 ZIP，也可手动下载后导入：
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `cosyvoice3-mnn-mobile-fp16-complete.zip` | ~1.3 GB | 完整 MNN 模型包（17 个文件） |
+| `cosyvoice3-mnn-mobile-fp16-complete.zip` | 1,399,083,563 B | 完整 MNN 模型包（17 个文件），SHA-256 `B1C74DFC...FEB1C84` |
 | `cosyvoice3-mnn-enrollment-extension.zip` | ~974 MB | 音色创建扩展（可选，如需手机创建音色） |
 
 ### 4. 导入模型
@@ -418,43 +426,18 @@ rand-noise.bin（symlink） # 符号链接到模型目录的共享噪声
 
 ---
 
-## GPU / CPU 后端切换
+## 自动硬件调度
 
-### Flow 后端
+用户不需要手动选择后端。App 按 SoC、OpenCL 和 Hexagon 初始化结果自动决定：
 
-UI 上的"Flow 后端"可选择：
+| 条件 | LLM | Flow | HiFT |
+|------|------|------|------|
+| 已验证 SM8850 + Hexagon 可用 | 第 0 层 q_proj NPU，其余 CPU | OpenCL | CPU |
+| 其他高通 / 其他 SoC | CPU | OpenCL 可用则 GPU，否则 CPU | CPU |
+| NPU Token 或报告异常 | 整句自动重跑 CPU | 不变 | 不变 |
 
-| 选项 | 说明 |
-|------|------|
-| **OpenCL（默认）** | GPU 加速，精度 `high`，推荐高通设备。自动检测可用性 |
-| **CPU** | MNN CPU 后端，精度 `normal`，6 线程。适用于无 OpenCL 设备 |
-
-### Flow OpenCL mode
-
-当后端为 OpenCL 时，可选择 GPU 计算模式：
-
-| 模式 | 值 | 说明 |
-|------|-----|------|
-| 自动 | 4 | 让 MNN 自行选择 |
-| Buffer | 68 | 用 OpenCL Buffer 内存（兼容性最好） |
-| Image | 132 | 用 OpenCL Image 内存（性能可能更好） |
-
-### HiFT 后端
-
-| 选项 | 说明 |
-|------|------|
-| **CPU（默认）** | 6 线程，稳妥 |
-| OpenCL | GPU 加速，兼容性可能不如 Flow |
-
-### 自动检测逻辑
-
-```kotlin
-fun detectBestFlowBackend(): String {
-    return if (openClAvailable) "opencl" else "cpu"
-}
-```
-
-检测方式：`System.loadLibrary("OpenCL")` — 如果能加载就认为是 OpenCL 可用。
+“运行库能加载”不等于“NPU 已验证”。未通过声音和 Token 正确性验证的 SoC
+不会自动启用 Hexagon。
 
 ---
 
@@ -543,10 +526,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 预编译的 .so 已包含在 `app/src/main/jniLibs/arm64-v8a/`。如需自己编译：
 
-1. 从 https://github.com/crisp-oss/mnn-cosyvoice-jni 获取源码
-2. 配置 Android NDK
-3. 用 CMake 交叉编译到 arm64-v8a
-4. 替换 `jniLibs/arm64-v8a/` 下的对应文件
+1. 使用 MNN 3.6.1、Android NDK r25c 和匹配设备的 Hexagon SDK。
+2. 应用 `mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch`。
+3. 将 `mnn-jni/` 加入 MNN 构建并交叉编译 arm64-v8a。
+4. 同时部署 `libMNN_htpops.so` 和 DSP Skeleton，不能只复制 Stub。
 
 ---
 
@@ -562,7 +545,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 1. **"LLM JNI 执行失败"** → 检查模型是否完整（"MNN 模型"卡片应该有绿色的"已安装"）
 2. **"Flow JNI 执行失败"** → 检查日志 `run-{timestamp}/flow-report.jsonl`，常见原因：
-   - OpenCL 设备不支持 → 手动切换 Flow 后端到 CPU
+   - OpenCL 设备不支持 → App 会自动使用 CPU
    - GPU 编译缓存损坏 → 删除模型重新导入
 3. **"HiFT JNI 执行失败"** → 类似 Flow 的排查方法
 
@@ -595,9 +578,9 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 1. 安装 APK
 2. 导入模型
-3. 在"GPU 调度"卡片中把 Flow 后端手动切换到 CPU
+3. App 会自动使用 CPU/OpenCL 兼容路径
 4. 试听
-5. **如果 CPU 模式也崩溃** → 请在 GitHub Issues 中提交 Logcat
+5. **如果兼容模式也崩溃** → 请在 GitHub Issues 中提交 Logcat
 
 ---
 
@@ -626,7 +609,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | Speech Tokenizer v3 | MNN | ~924 MB | Apache 2.0 | [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) |
 | CAM++ Speaker | MNN | ~27 MB | Apache 2.0 | [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) |
 
-模型下载链接：**[GitHub Releases 页面](https://github.com/Nian27/CosyVoice3-MNN/releases)**
+模型下载链接：**[Hugging Face 模型仓库](https://huggingface.co/VicenTrent/Cosy-Voice-MNN)**
 
 ---
 
@@ -648,7 +631,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 1. **非高通 Flow CPU 兼容性**：我没麒麟/天玑设备，`libcosy_flow_jni.so` 的 CPU 后端能不能用**完全没有验证**
 2. **首次加载慢**：冷态首次合成 GPU 需要编译 kernel，等待 10-15 秒是正常的
 3. **没有国际化**：UI 只有中文
-4. **APK 没有签名**：debug APK 直接安装，部分系统会提示"未知来源"
+4. **NPU 机型范围有限**：当前只有 SM8850 通过正确性和加速 A/B 验证
 
 ### 贡献方式
 

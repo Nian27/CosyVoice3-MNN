@@ -1,5 +1,6 @@
 package com.cosyvoice.app
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -10,17 +11,44 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 
+internal object CosyVoiceLlmOutputQuality {
+
+    private const val SPEECH_EOS = 158486
+
+    fun collapseReason(rawTokens: List<Int>): String? {
+        if (rawTokens.size < 2) return "原始 Token 为空"
+        val speechTokens = rawTokens.dropLastWhile { it == SPEECH_EOS }
+        val uniqueTokens = speechTokens.toSet().size
+        var longestRun = 0
+        var currentRun = 0
+        var previousToken: Int? = null
+        speechTokens.forEach { token ->
+            currentRun = if (token == previousToken) currentRun + 1 else 1
+            longestRun = maxOf(longestRun, currentRun)
+            previousToken = token
+        }
+        if (speechTokens.size >= 20 && uniqueTokens <= 4) {
+            return "Token 坍缩：count=${speechTokens.size}, unique=$uniqueTokens"
+        }
+        if (longestRun >= 8) {
+            return "Token 连续重复：longestRun=$longestRun"
+        }
+        return null
+    }
+}
+
 data class CosyVoiceSynthesisOptions(
-    val flowBackend: String = CosyVoiceRuntime.detectBestFlowBackend(),
-    val flowGpuMode: Int = 68,
-    val hiftCoreBackend: String = "cpu",
-    val hiftGpuMode: Int = 4,
+    val hardwarePlan: CosyVoiceHardwarePlan = CosyVoiceRuntime.recommendedHardwarePlan(),
+    val flowBackend: String = hardwarePlan.flowBackend,
+    val flowGpuMode: Int = hardwarePlan.flowGpuMode,
+    val hiftCoreBackend: String = hardwarePlan.hiftCoreBackend,
+    val hiftGpuMode: Int = hardwarePlan.hiftGpuMode,
     val voiceProfileId: String = CosyVoiceStore.DEFAULT_VOICE_PROFILE_ID,
     val inferenceMode: CosyVoiceInferenceMode = CosyVoiceInferenceMode.ZERO_SHOT,
     val instruction: String = ""
 ) {
     val flowPrecision: String get() = if (flowBackend == "cpu") "normal" else "high"
-    val flowThreads: Int get() = if (flowBackend == "cpu") 6 else flowGpuMode
+    val flowThreads: Int get() = if (flowBackend == "cpu") hardwarePlan.cpuThreads else flowGpuMode
 
     init {
         require(flowBackend in setOf("cpu", "opencl"))
@@ -57,7 +85,7 @@ data class CosyVoiceSynthesisReport(
         append("\nLLM %.2f 秒 · Flow %.2f 秒（首次/形状 %.2f 秒）· HiFT %.2f 秒".format(
             llmMs / 1000.0, flowInferenceMs / 1000.0, flowResizeMs / 1000.0, hiftMs / 1000.0
         ))
-        append("\n音色 ${voiceProfile.displayName} · ${options.inferenceMode.displayName()} · Flow ${options.flowBackend} mode ${options.flowGpuMode} · HiFT ${options.hiftCoreBackend} · peak %.3f · rms %.3f".format(pcmPeak, pcmRms))
+        append("\n音色 ${voiceProfile.displayName} · ${options.inferenceMode.displayName()} · ${options.hardwarePlan.summary()} · peak %.3f · rms %.3f".format(pcmPeak, pcmRms))
     }
 }
 
@@ -67,6 +95,8 @@ internal object CosyVoiceRuntime {
     private const val FLOW_CPU_THREADS = 6
     private val mutex = Mutex()
     private val activeProcess = AtomicReference<Process?>(null)
+    @Volatile
+    private var appContext: Context? = null
 
     private val openClAvailable: Boolean by lazy {
         try {
@@ -77,8 +107,24 @@ internal object CosyVoiceRuntime {
         }
     }
 
-    fun detectBestFlowBackend(): String {
-        return if (openClAvailable) "opencl" else "cpu"
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+        recommendedHardwarePlan()
+    }
+
+    fun detectBestFlowBackend(): String = recommendedHardwarePlan().flowBackend
+
+    fun recommendedHardwarePlan(): CosyVoiceHardwarePlan {
+        val context = checkNotNull(appContext) {
+            "CosyVoiceRuntime.initialize(context) 必须先调用"
+        }
+        val hexagonStatus = CosyVoiceHexagonBootstrap.initialize(context)
+        return CosyVoiceHardwarePolicy.recommend(
+            CosyVoiceHardwarePolicy.current(
+                openClAvailable = openClAvailable,
+                hexagonAvailable = hexagonStatus.available
+            )
+        )
     }
 
     suspend fun synthesize(
@@ -107,6 +153,12 @@ internal object CosyVoiceRuntime {
         val hiftInput = File(runDir, "hift-input").apply { mkdirs() }
         val hiftOutput = File(runDir, "hift-output").apply { mkdirs() }
         val model = store.modelDir
+        var effectiveOptions = options
+        if (options.hardwarePlan.llmBackend == "hexagon") {
+            File(model, "hexagon-stage-layers.txt").writeText("0", Charsets.US_ASCII)
+            File(model, "hexagon-stage-ops.txt").writeText("conv", Charsets.US_ASCII)
+            File(model, "hexagon-stage-name.txt").writeText("q_proj", Charsets.US_ASCII)
+        }
 
         val promptFile = File(runDir, "prompts.txt").apply {
             val prefix = if (options.inferenceMode == CosyVoiceInferenceMode.INSTRUCT2) {
@@ -119,14 +171,58 @@ internal object CosyVoiceRuntime {
 
         onStage("LLM 正在生成语音 Token")
         val llmStartedAt = System.nanoTime()
-        val llmExitCode = CosyVoiceLlmNative.run(
-            configPath = store.llmRuntimeConfig().absolutePath,
+        fun runLlm(candidate: CosyVoiceSynthesisOptions): Int = CosyVoiceLlmNative.run(
+            configPath = store.llmRuntimeConfig(candidate.hardwarePlan.llmBackend).absolutePath,
             promptsPath = promptFile.absolutePath,
             maxTokens = 500,
             promptSpeechTokensPath = voiceProfile.promptSpeechTokensFile.absolutePath,
             outputDirectory = llmOutput.absolutePath,
-            appendPromptSpeechTokens = options.inferenceMode == CosyVoiceInferenceMode.ZERO_SHOT
+            appendPromptSpeechTokens = candidate.inferenceMode == CosyVoiceInferenceMode.ZERO_SHOT
         )
+        fun hexagonFailureReason(): String? {
+            val reportFile = File(llmOutput, "llm-persistent.jsonl")
+            if (!reportFile.isFile) return "缺少 LLM 报告"
+            val report = runCatching { reportFile.firstJson() }
+                .getOrElse { return "LLM 报告无法解析" }
+            if (!report.optBoolean("continuousHexagon", false) ||
+                report.optString("stagedHexagonLayers").isBlank()
+            ) {
+                return "Native 未进入受限 q_proj Hexagon"
+            }
+            if (report.optInt("invalidOutputs", -1) != 0) {
+                return "LLM 存在非法输出"
+            }
+            val rawFile = File(llmOutput, "raw-output-ids-0.csv")
+            if (!rawFile.isFile) return "缺少原始 Token 报告"
+            return CosyVoiceLlmOutputQuality.collapseReason(
+                rawFile.readText().split(',').mapNotNull { it.trim().toIntOrNull() }
+            )
+        }
+        var llmExitCode = runCatching { runLlm(effectiveOptions) }.getOrDefault(-900)
+        val hexagonFailure = if (
+            llmExitCode == 0 && effectiveOptions.hardwarePlan.llmBackend == "hexagon"
+        ) {
+            hexagonFailureReason()
+        } else {
+            null
+        }
+        if (
+            effectiveOptions.hardwarePlan.llmBackend == "hexagon" &&
+            (llmExitCode != 0 || hexagonFailure != null)
+        ) {
+            val reason = hexagonFailure ?: "JNI 退出码 $llmExitCode"
+            Log.w(TAG, "Hexagon output rejected: $reason; retrying full sentence on CPU")
+            onStage("NPU 输出校验失败，正在自动切换 CPU")
+            CosyVoiceLlmNative.reset()
+            llmOutput.deleteRecursively()
+            llmOutput.mkdirs()
+            effectiveOptions = effectiveOptions.copy(
+                hardwarePlan = effectiveOptions.hardwarePlan.cpuFallback(
+                    "NPU 输出被质量门拒绝，已回退 CPU"
+                )
+            )
+            llmExitCode = runCatching { runLlm(effectiveOptions) }.getOrDefault(-900)
+        }
         val llmStage = (System.nanoTime() - llmStartedAt) / 1_000_000L
         check(llmExitCode == 0) { "LLM JNI 执行失败($llmExitCode)" }
         currentCoroutineContext().ensureActive()
@@ -232,7 +328,7 @@ internal object CosyVoiceRuntime {
             targetTokens = targetTokens, flowBucket = flowBucket,
             pcmPeak = hift.optDouble("pcmPeak", 0.0),
             pcmRms = hift.optDouble("pcmRms", 0.0),
-            voiceProfile = voiceProfile, options = options
+            voiceProfile = voiceProfile, options = effectiveOptions
         )
         Log.d(TAG, report.displayText().replace('\n', ' '))
         onStage("合成完成，正在播放")

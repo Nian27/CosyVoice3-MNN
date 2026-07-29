@@ -1,0 +1,64 @@
+diff --git a/source/backend/hexagon/execution/HexagonExecutionFactory.cpp b/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
+index d7d2684..0000000 100644
+--- a/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
++++ b/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
+@@ -22,3 +22,5 @@
+ #include "HexagonRelu6.hpp"
+ #include "HexagonPRelu.hpp"
+ #include "HexagonLSTM.hpp"
++#include <cstdlib>
++#include <string>
+@@ -28,6 +30,58 @@ namespace MNN {
+ Execution* HexagonExecutionFactory::create(const Op* op, const std::vector<Tensor*>& inputs,
+                                           const std::vector<Tensor*>& outputs, Backend* backend) {
++    const char* selectedLayers = std::getenv("MNN_HEXAGON_LAYERS");
++    if (selectedLayers != nullptr && selectedLayers[0] != '\0') {
++        const std::string opName = op->name() != nullptr ? op->name()->str() : "";
++        bool selected = false;
++        const std::string csv = "," + std::string(selectedLayers) + ",";
++        size_t begin = 0;
++        while (begin < csv.size()) {
++            const size_t end = csv.find(',', begin + 1);
++            if (end == std::string::npos) {
++                break;
++            }
++            const std::string layer = csv.substr(begin + 1, end - begin - 1);
++            if (!layer.empty() &&
++                opName.find("/layers." + layer + "/") != std::string::npos) {
++                selected = true;
++                break;
++            }
++            begin = end;
++        }
++        if (!selected) {
++            return nullptr;
++        }
++    }
++    const char* selectedOps = std::getenv("MNN_HEXAGON_OPS");
++    if (selectedOps != nullptr && selectedOps[0] != '\0') {
++        const std::string kind(selectedOps);
++        const bool selected =
++            (kind == "conv" && op->type() == OpType_Convolution) ||
++            (kind == "layernorm" && op->type() == OpType_LayerNorm) ||
++            (kind == "rope" && op->type() == OpType_RoPE) ||
++            (kind == "binary" && op->type() == OpType_BinaryOp) ||
++            (kind == "unary" && op->type() == OpType_UnaryOp);
++        if (!selected) {
++            return nullptr;
++        }
++    }
++    const char* selectedName = std::getenv("MNN_HEXAGON_NAME");
++    if (selectedName != nullptr && selectedName[0] != '\0') {
++        const std::string opName = op->name() != nullptr ? op->name()->str() : "";
++        if (opName.find(selectedName) == std::string::npos) {
++            return nullptr;
++        }
++        MNN_ERROR("[MNN::Hexagon] staged op=%s\n", opName.c_str());
++    }
++    if (op->name() != nullptr &&
++        op->name()->str().find("/lm/lm_head/") != std::string::npos) {
++        return nullptr;
++    }
+     switch (op->type()) {
+         case OpType_LayerNorm:
+             return HexagonLayerNorm::create(backend, op);

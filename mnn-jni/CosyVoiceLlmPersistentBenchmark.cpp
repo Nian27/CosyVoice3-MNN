@@ -80,6 +80,21 @@ bool writeSpeechTokens(const std::string& path, const std::vector<int>& outputId
     return static_cast<bool>(output);
 }
 
+bool writeAllTokens(const std::string& path, const std::vector<int>& outputIds) {
+    std::ofstream output(path);
+    if (!output) {
+        return false;
+    }
+    for (size_t index = 0; index < outputIds.size(); ++index) {
+        if (index != 0) {
+            output << ',';
+        }
+        output << outputIds[index];
+    }
+    output << '\n';
+    return static_cast<bool>(output);
+}
+
 std::string joinPath(const std::string& directory, const std::string& file) {
     if (directory.empty()) {
         return file;
@@ -155,6 +170,35 @@ int cosyVoiceLlmMain(int argc, const char* argv[]) {
         return 3;
     }
 
+    const bool hexagonRuntime = configPath.find("hexagon") != std::string::npos;
+    const size_t configSlash = configPath.find_last_of("/\\");
+    const std::string configDirectory =
+        configSlash == std::string::npos ? "." : configPath.substr(0, configSlash);
+    const std::vector<std::string> stagedLayerLines =
+        readLines(joinPath(configDirectory, "hexagon-stage-layers.txt"));
+    const std::string stagedHexagonLayers =
+        stagedLayerLines.empty() ? "" : stagedLayerLines.front();
+    const std::vector<std::string> stagedOpLines =
+        readLines(joinPath(configDirectory, "hexagon-stage-ops.txt"));
+    const std::string stagedHexagonOps =
+        stagedOpLines.empty() ? "" : stagedOpLines.front();
+    const std::vector<std::string> stagedNameLines =
+        readLines(joinPath(configDirectory, "hexagon-stage-name.txt"));
+    const std::string stagedHexagonName =
+        stagedNameLines.empty() ? "" : stagedNameLines.front();
+    const bool continuousHexagon = hexagonRuntime && !stagedHexagonLayers.empty();
+    if (continuousHexagon) {
+        setenv("MNN_HEXAGON_LAYERS", stagedHexagonLayers.c_str(), 1);
+        setenv("MNN_HEXAGON_OPS", stagedHexagonOps.c_str(), 1);
+        setenv("MNN_HEXAGON_NAME", stagedHexagonName.c_str(), 1);
+    } else {
+        unsetenv("MNN_HEXAGON_LAYERS");
+        unsetenv("MNN_HEXAGON_OPS");
+        unsetenv("MNN_HEXAGON_NAME");
+    }
+    unsetenv("MNN_HEXAGON_ATTENTION");
+    unsetenv("MNN_HEXAGON_ATTENTION_LAYER");
+
     LlmRuntimeState& runtime = llmRuntimeState();
     double loadMs = 0.0;
     if (!runtime.llm || runtime.configPath != configPath) {
@@ -220,6 +264,12 @@ int cosyVoiceLlmMain(int argc, const char* argv[]) {
             std::cerr << "cannot_write_tokens=" << tokenFile << std::endl;
             return 6;
         }
+        const std::string rawTokenFile =
+            joinPath(outputDirectory, "raw-output-ids-" + std::to_string(request) + ".csv");
+        if (!writeAllTokens(rawTokenFile, outputIds)) {
+            std::cerr << "cannot_write_raw_tokens=" << rawTokenFile << std::endl;
+            return 6;
+        }
 
         const int64_t prefillDelta = context->prefill_us >= prefillBefore
                                          ? context->prefill_us - prefillBefore
@@ -241,6 +291,11 @@ int cosyVoiceLlmMain(int argc, const char* argv[]) {
                 << ",\"invalidOutputs\":" << invalid
                 << ",\"promptSpeechTokensAppended\":"
                 << (appendPromptSpeechTokens ? "true" : "false")
+                << ",\"hybridNpuPrefill\":false"
+                << ",\"continuousHexagon\":" << (continuousHexagon ? "true" : "false")
+                << ",\"stagedHexagonLayers\":\"" << stagedHexagonLayers << "\""
+                << ",\"stagedHexagonOps\":\"" << stagedHexagonOps << "\""
+                << ",\"stagedHexagonName\":\"" << stagedHexagonName << "\""
                 << ",\"loadMs\":" << loadMs
                 << ",\"prefillMs\":" << prefillMs
                 << ",\"decodeMs\":" << decodeMs

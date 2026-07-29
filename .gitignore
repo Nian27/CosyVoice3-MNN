@@ -5,6 +5,7 @@
 build/
 */build/
 local.properties
+signing.properties
 *.apk
 *.ap_
 *.dex
