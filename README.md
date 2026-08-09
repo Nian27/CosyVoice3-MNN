@@ -621,6 +621,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 |------|------|
 | [docs/DEVELOPMENT_STORY.md](docs/DEVELOPMENT_STORY.md) | 完整开发历程：CrispASR/ggml+Vulkan 路线失败 → 转 MNN/OpenCL → Flow 蒸馏 → 真机调优全过程 |
 | [docs/RESEARCH_MEMORY.md](docs/RESEARCH_MEMORY.md) | 各阶段决策、数据、教训与研究记忆 |
+| [docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md) | 踩坑与解决办法汇总（07-23 真机调优 + MNN/Hexagon QNN NPU 实验） |
 | [docs/NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md) | MNN/Hexagon NPU 验证记录（部分成功） |
 | [mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch](mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch) | MNN Hexagon 算子分阶段过滤补丁 |
 
