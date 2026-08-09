@@ -201,64 +201,26 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 
 ## 问题记录（供后续开发者参考）
 
-> ⚠️ 以下 fix **只在我的手机（荣耀 Magic8 Pro / SM8850）上测试过**。非高通手机能否正常工作**还不确定**，欢迎有麒麟/天玑设备的朋友帮忙验证并提交反馈。
+> 分两部分：**历史已修复（早期 App 层问题）** 与 **当前已知问题（2026-08 状态）**。
+> 完整踩坑历程（12 大类：Vulkan 环境、转换改坏、假加速、音频后处理、量化失败等）见 [docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)。
 
-### 1. 非高通手机 OpenCL 闪退（不确定是否完全解决）
+### 历史已修复（早期 App 层问题）
 
-**症状**：华为麒麟 / 联发科天玑手机安装后闪退，Logcat 看到 `libOpenCL.so not found`
+1. **非高通 OpenCL 闪退**：Manifest `uses-native-library libOpenCL.so required=true` 只有 Adreno 有 → 独立 App 不加该声明，`CosyVoiceRuntime.detectBestFlowBackend()` 运行时检测，没有就降级 CPU。*非高通真机仍待实测（见下方已知问题 4）。*
+2. **Flow 只支持 OpenCL、无 CPU fallback**：backend 硬编码 `"opencl"` → `CosyVoiceSynthesisOptions` 新增 `flowBackend` 字段并下传，CPU 模式自动 `precision="normal"`、`threads=6`。
+3. **`extractNativeLibs` 导致 .so 加载失败**（`UnsatisfiedLinkError`）→ cosytest 与独立 App 均加 `jniLibs.useLegacyPackaging = true`。
+4. **首次打开 App 空指针崩溃**：模型未就绪时 `selectVoiceProfile()` 抛异常 → 加 `if (modelStatus().ready)` 保护。
+5. **导出模型时 ContentProvider URI 残留**：写入失败后 uri 处理不对 → try-catch 包裹，失败时显式删除不完整文件。
+6. **GPU 编译缓存不清理**：切换 backend 后首合成 30+ 秒 → 删除模型时一并删除 `gpu-cache/`。
 
-**根因**：AndroidManifest.xml 中 `<uses-native-library android:name="libOpenCL.so" android:required="true"/>` — 只有 Qualcomm Adreno GPU 有这个库
+### 当前已知问题（2026-08）
 
-**尝试的修复（2 处改动，未在非高通设备上实测）**：
-- 原本 cosytest 的 Manifest 有 `required="true"`，独立 App 新建 Manifest 时直接没加这一行
-- 运行时检测：`CosyVoiceRuntime.detectBestFlowBackend()` 用 `System.loadLibrary("OpenCL")` 检测，没有就降级到 CPU
-- **但我无法确认 Flow CPU 的 libcosy_flow_jni.so 是否真的能在非高通设备上运行**
-
-关联代码：`CosyVoiceRuntime.kt:71-82` → `detectBestFlowBackend()`
-
-### 2. Flow 阶段只支持 OpenCL，没有 CPU fallback
-
-**症状**：非高通手机上 Flow 阶段直接崩溃
-
-**根因**：MNN Flow JNI 的 `backend` 参数硬编码为 `"opencl"`
-
-**修复**：`CosyVoiceSynthesisOptions` 新增 `flowBackend` 字段，`CosyVoiceFlowNative.run()` 把 backend 参数传下去。CPU 模式下自动设置 `precision="normal"`, `threads=6`
-
-关联代码：`CosyVoiceRuntime.kt:14` → `flowBackend` 默认值
-
-### 3. `extractNativeLibs` 配置问题导致 .so 加载失败
-
-**症状**：`System.loadLibrary("cosy_llm_jni")` 抛 `UnsatisfiedLinkError`
-
-**根因**：原本 cosytest 的 Android 12+ 设备上 `extractNativeLibs=false`，.so 未被提取到 native lib 目录
-
-**修复**：在 cosytest 的 `app/build.gradle.kts` 中添加了 `jniLibs.useLegacyPackaging = true`。独立 App 也已加上此配置。
-
-### 4. 首次打开 App 空指针崩溃
-
-**症状**：打开 App 后未导入模型时，点击"试听"崩溃
-
-**根因**：`refresh()` 调用 `selectVoiceProfile()`，而 `loadVoiceProfile()` 内部 `check(modelStatus().ready)` 在模型未就绪时抛异常
-
-**修复**：`CosyVoiceStore.selectVoiceProfile()` 加 `if (modelStatus().ready)` 保护
-
-关联代码：`CosyVoiceStore.kt:87-92`
-
-### 5. 导出模型时 ContentProvider URI 残留
-
-**症状**：模型导出失败后，uri 被 ContentResolver 删除，但实际上文件没写完整（或者相反）
-
-**根因**：异常处理中 `delete()` 调用不对
-
-**修复**：用 try-catch 包裹写入逻辑，失败时显式删除不完整的 uri
-
-### 6. GPU 编译缓存没有清理干净
-
-**症状**：切换 Flow backend 后首次合成特别慢（30+ 秒），之后正常
-
-**根因**：不同 backend/mode 的 GPU 编译缓存是分开的，但旧缓存不会被自动清理
-
-**当前状态**：删除模型时会一并删除 `gpu-cache/` 目录。手动切换 backend 后可以手动删一次。
+1. **NPU（QAIRT QNN HTP）HiFT 未过最终音频门槛（实验进行中，不进入正式版）**：性能已达标（24.77 ms/12帧，比 CPU ≈36 ms 快约 31%），84 窗 out18 tensor corr 0.99756，但最终 PCM corr 仅 0.835、relative L2 0.563——局部 Tensor 误差经幅度/相位/ISTFT/OLA 被放大。详见 [PITFALLS_AND_FIXES.md 第 8 类](docs/PITFALLS_AND_FIXES.md)。
+2. **Flow Session 池产品稳定性**：性能逻辑已明确（共享 Runtime、1-2 常驻 Session、LRU、后台预热），正常合成/冷启动/长句/连续使用的稳定性验收未完成。
+3. **长句 CPU HiFT 退化**：342 帧约 3.9ms/帧，864 帧约 8.1ms/帧（单位帧耗时翻倍，非线性），根因未完全定位。
+4. **非高通设备未验证**：`libcosy_flow_jni.so` 的 CPU 后端在麒麟/天玑上能否运行**完全没有真机验证**。
+5. **冷启动慢**：冷态首次合成 GPU 编译 kernel 等待 10-15 秒是正常的（正式 App 有 GPU 编译缓存）。
+6. **无国际化**：UI 只有中文。
 
 ---
 
@@ -673,7 +635,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 1. **非高通 Flow CPU 兼容性**：我没麒麟/天玑设备，`libcosy_flow_jni.so` 的 CPU 后端能不能用**完全没有验证**
 2. **首次加载慢**：冷态首次合成 GPU 需要编译 kernel，等待 10-15 秒是正常的
 3. **没有国际化**：UI 只有中文
-4. **NPU 机型范围有限**：当前只有 SM8850 通过正确性和加速 A/B 验证
+4. **NPU 机型范围有限**：当前只有 SM8850 通过正确性和加速 A/B 验证（且只到 q_proj 单算子，全图未过音频门槛）
+5. **长句 HiFT 退化**：864 帧约 8.1ms/帧 vs 342 帧约 3.9ms/帧，单位帧耗时翻倍，未彻底解决
+
+> 完整"当前已知问题"列表（含 NPU 实验状态、Flow Session 池等）见 [问题记录](#问题记录供后续开发者参考)。
 
 ### 贡献方式
 
