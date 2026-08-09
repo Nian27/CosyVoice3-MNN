@@ -119,3 +119,15 @@
 - 自动配音时，主角/重要角色会优先选择明确音色偏好或性别、年龄分类匹配的本地音色；普通角色仍优先 HTTPS，旁白默认仍由云健策略决定。CosyVoice 同步不再覆盖用户手动修改的音色分类，本地音色分类也不再伪装成 HTTP 发言人组。
 - Honor BKQ_AN90 真机验证：当前章剩余 23 段进入同一任务，进度从 0 推进到 7；诊断日志显示初始 2 条后连续追加到 `total=17`，播放器实际跨过 cue 36、37、38，转场日志为 `playlist=2/17`、`3/17`，证明不再在第二句结束队列。
 - `compileCosytestDebugKotlin`、`testCosytestDebugUnitTest`、`compileAppDebugKotlin`、`assembleCosytestDebug` 均通过。已保留数据覆盖安装 `legado_cosytest_3.26.07211004_460721100.apk`，68,134,530 bytes，SHA-256 `4C8B3B021EC0AD9BB59FFDBEA37C6211C3A1B7B2B0F19053ADC68DBD5C5E6160`。
+
+## 2026-07-26 ~ 08-06 MNN/QNN NPU 定向实验（独立 App 化之后）
+
+- 独立 App（CosyVoice3-MNN）发布 v1.1.0 后转入加速器实验：MNN 3.6.1 + Hexagon V81（QNN backend）+ OpenCL 并存，目标是把 LLM 部分算子、Flow、HiFT 分别放到各自最合适的硬件路径。完整计划文档：`docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md`（冻结基线 `baseline-20260806`）。
+- MNN QNN backend 三维张量布局错误：1D 卷积/时间序列的 3 维 NCHW `{n,c,h}` 与 TENSORFLOW 视图 3 维张量送 QNN 后 shape 错乱。修复为 QNN 需要的 4 维 NHWC `{n,h,w=1,c}`（插入宽度轴并交换 c/h），改 `QNNBackend.cpp`/`QNNUtils.cpp`，补丁 `qnn-layout-fix.patch`。
+- MNN CPU 线程池缺陷：worker 只检查 `mActiveCount`，栅栏等待时可能丢任务或忙等。改为扫描全部任务位，无 pending 才条件等待，补丁 `threadpool-fix.patch`。
+- QNN 全图/大算子实验在 PC 上用 QNN QEMU（`libQnnHtpQemu.so`）预生成 context 再上真机：Graph Optimizations 约 10-14 秒、VTCM Allocation 约 21.8 秒；VTCM 8 MB 不够时产生约 73 MB DDR spill（spill_bytes=73,166,848），spill 到 DDR 的图性能不可用。
+- x86_64 模拟链接坑：`objcopy` 生成的 raw ELF object 是 ARM 架构，链接进 i386:x86-64 输出报 `unknown architecture of input file ... incompatible with i386:x86-64 output`；PC 模拟构建必须统一架构（用对应架构的 objcopy/链接器或直接构建 arm64）。
+- HiFT 上 HTP 的早期尝试（12 帧窗口切分 + FP32 图）实测约 4.5 秒/窗口，远差于 CPU 342 帧约 1.35 秒；异步提交耗时、输出不随输入变化的“假执行”缓存、离线单窗耗时都不能当作真实性能。这些路线已在计划文档中列为“已证明不能继续重复”。
+- LLM Decode 约占耗时 79%（±3%），主要瓶颈在 Decode 而非 Prefill；MNN LLM 重新导出启用 C4/W4 block64 后以 CPU Decode 优化为主，Hexagon 只承担 Prefill 或单算子（q_proj）验证。
+- 精度与听感验收口径：所有基准同时检查 finite、RMS、ONNX 数值误差和“换输入输出必须改变”；App 内模块耗时（L2）与端到端 RTF（L3）分开统计，不能用推理耗时冒充端到端。
+- 最终 NPU 部分成功结论（v1.1.0 验证）：仅 `q_proj` 单算子放 Hexagon，LLM wall time -5.94%、decode TPS +5.93%，收益有限；逐算子出现过 Token 崩溃/非法 Token，未通过的算子不得启用；MNN Hexagon 需按 SoC 配套 stub/skel，默认全部设备走 CPU/OpenCL。详见 `docs/NPU_RELEASE_VALIDATION.md` 与 `mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch`。

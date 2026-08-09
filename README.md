@@ -13,6 +13,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 ## 目录
 
 - [项目背景](#项目背景)
+- [尝试过的路线（历程）](#尝试过的路线历程)
 - [整体架构](#整体架构)
 - [合成管线详解（4 个阶段）](#合成管线详解4-个阶段)
 - [移植过程](#移植过程)
@@ -31,6 +32,25 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 - [模型信息](#模型信息)
 - [欢迎参与](#欢迎参与)
 - [许可证](#许可证)
+
+---
+
+## 尝试过的路线（历程）
+
+这个项目走过很多条路，有成功的、有失败的、有部分成功的，全部记录如下：
+
+| 路线 | 结果 | 关键文档 |
+|------|------|----------|
+| **CrispASR/ggml + Vulkan**（第一尝试） | ❌ 失败：Adreno DeviceLost、FP16 噪声、RTF 5.11 | [DEVELOPMENT_STORY.md 第 2 节](docs/DEVELOPMENT_STORY.md#2-第一阶段crispasrggml--vulkan-路线失败) |
+| **MNN/OpenCL**（第二尝试，当前主线） | ✅ 成功发布 v1.1.0，但热态 RTF 仅 0.79~1.0、内存 2.25 GB、仅 SM8850 单机验证，**实际效果没有想象中好** | [DEVELOPMENT_STORY.md](docs/DEVELOPMENT_STORY.md)、[性能数据](#性能数据荣耀-magic8-pro-真机实测) |
+| **Flow 蒸馏**（关键突破） | ✅ 10 步 → 2 步，seq516 从 18.4 秒降到 2.374 秒 | [STAGE3_FEASIBILITY.md](research/mnn-cosyvoice3/STAGE3_FEASIBILITY.md) |
+| **MNN + Hexagon NPU（单算子）** | ⚠️ 部分成功：仅 q_proj 放 NPU（wall time -5.94%），收益有限，Token 崩溃风险 | [NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md)、[加速器改造计划](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
+| **HiFT 切 12 帧窗口上 HTP**（早期尝试） | ❌ 失败：约 4.5 秒/窗口，假执行/异步提交耗时不能当真 | [加速器改造计划 1.3 节](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
+| **QAIRT QNN 全图 HTP 迁移** | ⏳ 进行中，未完成，暂不公开细节 | — |
+
+踩坑红线（已证明不能继续重复）：FP32 HiFT 切 12 帧窗口强行上 HTP；把异步提交时间当真实执行时间；输出不随输入变化的 cache“假执行”；热路径反复 createSession/resizeSession/OpenCL tuning；用离线单窗耗时冒充端到端 RTF。
+
+完整的踩坑与解决办法：**[docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)**、**[docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md)**（冻结基线 `baseline-20260806`）。
 
 ---
 

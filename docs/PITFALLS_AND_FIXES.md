@@ -44,23 +44,11 @@
 - **现象**：加载后 App PSS 约 2.25 GB，`/dev/kgsl-3d0` 约 1,268.6 MB，scudo secondary 约 607.3 MB。
 - **解决**：整批预合成结束后自动 `CosyVoiceRuntime.close()` 释放 LLM/Flow/HiFT Session，已生成 WAV 继续播放；队列代次保护阻止旧章节收尾误释放新章节正在复用的运行时；禁止逐句释放。退出管理页必须在未被 UI scope 取消的独立 IO scope 中关闭（否则先取消 scope 导致释放任务永远不执行，真机 PSS 从约 946.7 MB 降到 268.9 MB）。
 
-### 7. 硬件能力显示误导
-
-- **现象**：界面称"NPU 已启用"，但 `qnnBackendBundled=false`、实际合成仍是 CPU。
-- **根因**：APK 没有 QNN/HTP backend 或配套库，手机有 NPU ≠ App 有可用执行路径；MNN QNN 要求按高通 SoC/Hexagon 版本配套 QNN stub/skel 库。
-- **解决**：NPU 只能作为独立 PoC 验证，不能显示为已启用；OpenCL 3.0 只用于 GPU 路线，不能激活 NPU。
-
-### 8. 本地音色分配不到
-
-- **现象**：默认"其他音色"档案始终分配不到角色。
-- **根因**：主角/重要角色匹配性别/年龄标签时排除了未分类音色，但未分类音色应作为兜底候选。
-- **解决**：没有明确标签匹配时可选择未分类本地零样本音色，但排除明确相反性别和不兼容年龄标签；本地音色目录 App 启动时同步，不再依赖先打开管理页。
-
 ---
 
 ## 二、MNN/Hexagon QNN NPU 实验阶段（WSL Ubuntu + MNN 3.6.1 + Hexagon V81）
 
-### 9. MNN QNN backend 三维卷积布局错误（qnn-layout-fix.patch）
+### 7. MNN QNN backend 三维卷积布局错误（qnn-layout-fix.patch）
 
 - **现象**：1D 卷积/时间序列张量（MNN 3 维）送 QNN 后 shape 错误、输出错乱。
 - **根因**：MNN 的 3 维 NCHW 张量是 `{n, c, h}`（1D conv，宽隐含），QNN 的 Conv2d 需要 4 维 NHWC `{n, h, w=1, c}`；TENSORFLOW 视图的临时张量也缺宽度轴。
@@ -70,14 +58,14 @@
   - `getNHWCShape()` 同样处理 3 维 NCHW 常量。
 - **补丁**：`qnn-layout-fix.patch`。
 
-### 10. MNN CPU 线程池忙等/丢失任务（threadpool-fix.patch）
+### 8. MNN CPU 线程池忙等/丢失任务（threadpool-fix.patch）
 
 - **现象**：多任务场景线程池 worker 可能丢任务或忙等，耗时不稳定。
 - **根因**：worker 循环只检查 `mActiveCount`，任务栅栏已在等待、active 计数已清零时不会重新扫描任务位；存在 pending 任务时忙等不做正确让步。
 - **解决**：worker 循环改为扫描全部任务位 `mTasks[i].second[threadIndex]`，发现 pending 继续执行；无 pending 再进条件等待。
 - **补丁**：`threadpool-fix.patch`。
 
-### 11. LLM q_proj 单算子放 NPU：成功但收益很小
+### 9. LLM q_proj 单算子放 NPU：成功但收益很小
 
 - **现象**：仅 `layers.0/self_attn/q_proj/Linear` 放 Hexagon NPU，LLM wall time P50 从 1598.23 ms 降到 1503.35 ms（-5.94%），decode TPS 从 95.57 到 101.23（+5.93%）；NPU 推理 3/3 成功，PCM 无异常。
 - **根因**：LLM 其余部分（Attention、KV Cache、lm_head）仍跑 CPU；NPU 只分到一小块算子，收益被 CPU 瓶颈掩盖。
@@ -85,7 +73,7 @@
 - **坑**：MNN Hexagon 后端需要逐 SoC 配套 stub/skel 库；不同 SoC 不能共用同一套 NPU 包。
 - **文件**：`mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch`（算子分阶段过滤）、`mnn-jni/CosyVoiceLlmPersistentBenchmark.cpp`（NPU A/B 基准入口，支持 `hexagon` backend 选择）、`docs/NPU_RELEASE_VALIDATION.md`（完整验证记录）。
 
-### 12. MNN 外部权重缺失时"全零成功"
+### 10. MNN 外部权重缺失时"全零成功"
 
 - **现象**：缺失 `.weight` 外部文件时 MNN 打印 `Can't open file` 后仍返回全零"成功"输出。
 - **解决**：所有基准必须同时检查 finite、RMS 和 ONNX 数值误差，不能只看"返回成功"。
