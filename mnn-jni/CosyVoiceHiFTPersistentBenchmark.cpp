@@ -59,6 +59,9 @@ MNNForwardType parseHiFTBackend(const std::string& value) {
     if (value == "opencl") {
         return MNN_FORWARD_OPENCL;
     }
+    if (value == "hexagon") {
+        return MNN_FORWARD_USER_1;
+    }
     return MNN_FORWARD_ALL;
 }
 
@@ -183,7 +186,7 @@ int cosyVoiceHiFTMain(int argc, char** argv) {
 
     for (size_t requestIndex = 0; requestIndex < requests.size(); ++requestIndex) {
         const HiFTRequest& request = requests[requestIndex];
-        const int runtimeFrames = coreBackend == MNN_FORWARD_OPENCL
+        const int runtimeFrames = coreBackend != MNN_FORWARD_CPU
                                       ? selectHiFTFrameBucket(request.melFrames)
                                       : request.melFrames;
         const size_t sourceSamples = static_cast<size_t>(request.melFrames) * kMelHop;

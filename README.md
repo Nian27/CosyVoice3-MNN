@@ -613,6 +613,27 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ---
 
+## 实验记录与现状说明
+
+本项目是**持续进行的实验项目**。完整的开发历程、失败记录、踩过的坑和解决方案见：
+
+| 文档 | 内容 |
+|------|------|
+| [docs/DEVELOPMENT_STORY.md](docs/DEVELOPMENT_STORY.md) | 完整开发历程：CrispASR/ggml+Vulkan 路线失败 → 转 MNN/OpenCL → Flow 蒸馏 → 真机调优全过程 |
+| [docs/RESEARCH_MEMORY.md](docs/RESEARCH_MEMORY.md) | 各阶段决策、数据、教训与研究记忆 |
+| [docs/NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md) | MNN/Hexagon NPU 验证记录（部分成功） |
+| [mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch](mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch) | MNN Hexagon 算子分阶段过滤补丁 |
+
+### 坦诚说明（重要）
+
+1. **MNN 路线是成功的，但实际效果没有想象中好**：全链路在 SM8850（荣耀 Magic8 Pro）真机跑通并发布了 v1.1.0，但热态 RTF 约 0.79~1.0（勉强实时），冷启动 10-15 秒，常驻内存 2.25 GB+，且只在 SM8850 一台设备验证过；非高通设备完全未验证。
+2. **NPU（Hexagon）只部分成功**：仅 `q_proj` 单个算子放 NPU 通过验证（LLM wall time -5.94%、decode TPS +5.93%），收益有限；MNN Hexagon 需按 SoC 配套 stub/skel 库，默认不启用，不能作为正式 NPU 方案。
+3. **后续 NPU/加速实验仍在进行中，未完成，暂不公开细节**。
+
+本项目定位是"实验验证 + 单机可用"，不是开箱即用的通用本地 TTS 方案。
+
+---
+
 ## 欢迎参与
 
 **目前这个项目只在我的一台荣耀 Magic8 Pro（SM8850）上测试通过**。非高通设备（麒麟/天玑/Exynos）能不能跑、跑得怎么样，都需要大家帮忙验证。
