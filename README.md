@@ -46,11 +46,11 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 | **Flow 蒸馏**（关键突破） | ✅ 10 步 → 2 步，seq516 从 18.4 秒降到 2.374 秒 | [STAGE3_FEASIBILITY.md](research/mnn-cosyvoice3/STAGE3_FEASIBILITY.md) |
 | **MNN + Hexagon NPU（单算子）** | ⚠️ 部分成功：仅 q_proj 放 NPU（wall time -5.94%），收益有限，Token 崩溃风险 | [NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md)、[加速器改造计划](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
 | **HiFT 切 12 帧窗口上 HTP**（早期尝试） | ❌ 失败：约 4.5 秒/窗口，假执行/异步提交耗时不能当真 | [加速器改造计划 1.3 节](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
-| **QAIRT QNN 全图 HTP 迁移** | ⏳ 进行中，未完成，暂不公开细节 | — |
+| **QAIRT QNN 全图 HTP 迁移** | ⏳ 进行中：converter 语义已证明（P4.2 WAV corr=1.0）、A16W8 per-channel 达 24.77ms/12帧，但最终 PCM 未达标（corr 0.835） | [PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md) 第 8 类 |
 
 踩坑红线（已证明不能继续重复）：FP32 HiFT 切 12 帧窗口强行上 HTP；把异步提交时间当真实执行时间；输出不随输入变化的 cache“假执行”；热路径反复 createSession/resizeSession/OpenCL tuning；用离线单窗耗时冒充端到端 RTF。
 
-完整的踩坑与解决办法：**[docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)**、**[docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md)**（冻结基线 `baseline-20260806`）。
+完整的踩坑与解决办法：**[docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)**（全历程 12 大类总结：现象 → 根因 → 解决 → 汇总表 → 剩余 3 坑 → 三大教训）、**[docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md)**（冻结基线 `baseline-20260806`）。
 
 ---
 
@@ -641,7 +641,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 |------|------|
 | [docs/DEVELOPMENT_STORY.md](docs/DEVELOPMENT_STORY.md) | 完整开发历程：CrispASR/ggml+Vulkan 路线失败 → 转 MNN/OpenCL → Flow 蒸馏 → 真机调优全过程 |
 | [docs/RESEARCH_MEMORY.md](docs/RESEARCH_MEMORY.md) | 各阶段决策、数据、教训与研究记忆 |
-| [docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md) | 踩坑与解决办法汇总（07-23 真机调优 + MNN/Hexagon QNN NPU 实验） |
+| [docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md) | 全历程踩坑与解决 12 大类总结（含汇总表、剩余 3 坑、三大教训） |
 | [docs/NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md) | MNN/Hexagon NPU 验证记录（部分成功） |
 | [mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch](mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch) | MNN Hexagon 算子分阶段过滤补丁 |
 
@@ -649,7 +649,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 1. **MNN 路线是成功的，但实际效果没有想象中好**：全链路在 SM8850（荣耀 Magic8 Pro）真机跑通并发布了 v1.1.0，但热态 RTF 约 0.79~1.0（勉强实时），冷启动 10-15 秒，常驻内存 2.25 GB+，且只在 SM8850 一台设备验证过；非高通设备完全未验证。
 2. **NPU（Hexagon）只部分成功**：仅 `q_proj` 单个算子放 NPU 通过验证（LLM wall time -5.94%、decode TPS +5.93%），收益有限；MNN Hexagon 需按 SoC 配套 stub/skel 库，默认不启用，不能作为正式 NPU 方案。
-3. **后续 NPU/加速实验仍在进行中，未完成，暂不公开细节**。
+3. **后续 NPU/加速实验（QAIRT QNN 全图）仍在进行中**：目前进展与结论已总结在 [docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)（A16W16 快但坏音、A16W8 per-channel 24.77ms 但 PCM 未达标等），未完成部分暂不公开实验产物细节。
 
 本项目定位是"实验验证 + 单机可用"，不是开箱即用的通用本地 TTS 方案。
 

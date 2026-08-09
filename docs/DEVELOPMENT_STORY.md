@@ -391,9 +391,10 @@ research/mnn-cosyvoice3/
 | CrispASR/ggml + Vulkan | 07-14 | ❌ 失败：Adreno DeviceLost、FP16 噪声、RTF 5.11 | 本文件第 2 节 |
 | MNN/OpenCL（LLM CPU + Flow GPU + HiFT CPU） | 07-15 ~ 07-21 | ✅ 成功发布 v1.1.0，但热态 RTF 仅 0.79~1.0、内存 2.25 GB、仅 SM8850 单机验证 | 本文件第 3-6 节、`docs/NPU_RELEASE_VALIDATION.md` |
 | Flow 蒸馏（CFG 单分支 + 两步宏轨迹） | 07-15 | ✅ 关键突破：10 步 → 2 步，seq516 从 18.4 秒降到 2.374 秒 | `research/mnn-cosyvoice3/STAGE3_FEASIBILITY.md` |
+| P3 HiFT 回归 Student（从 source 学 Teacher） | 08 月初 | ❌ 失败：Student 连单样本都表达不了（单样本 corr≈0.007），全部趋向静态谱 | `docs/PITFALLS_AND_FIXES.md` 第 6 类 |
 | MNN + Hexagon QNN（单算子 NPU） | 07-26 ~ 08-06 | ⚠️ 部分成功：仅 q_proj 放 NPU（-5.94%），收益有限、逐算子有 Token 崩溃风险 | `docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md`、`docs/NPU_RELEASE_VALIDATION.md`、`mnn-patches/*.patch` |
 | HiFT 切 12 帧窗口上 HTP（早期） | 08 月初 | ❌ 失败：约 4.5 秒/窗口，不可用；假执行/异步提交耗时不能当真 | `docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md` 第 1.3 节 |
-| QAIRT QNN 全图 HTP 迁移（HiFT/Flow） | 08 月 | ⏳ 进行中，未完成，暂不公开细节 | — |
+| QAIRT QNN 全图 HTP 迁移（HiFT/Flow） | 08 月 | ⏳ 进行中：converter 语义已证明（P4.2 WAV corr=1.0）；A16W16 快但坏音（corr 0.18）；A16W8 per-channel + conv_post FP16 达 24.77ms 但 PCM corr 0.835，未过最终音频门槛 | — |
 
 已证明不能继续重复的路线（踩坑红线）：不要把 FP32 HiFT 切 12 帧窗口强行上 HTP；不要把异步提交时间当真实执行时间；不要用输出不随输入变化的 cache“假执行”；不要在产品热路径反复 createSession/resizeSession/OpenCL tuning；不要用离线单窗耗时替代 App 模块耗时和端到端 RTF。
 
