@@ -34,3 +34,15 @@
   完整 ZIP，支持断点续传、整包 SHA-256 和内部 17 文件二次校验；安装成功后
   删除临时 ZIP。
 - 构建缓存固定在 `E:\AndroidBuildCache\CosyVoice3-MNN`，避免占用 C 盘。
+
+## 实验记录文档
+
+后续开发前先读 `docs/` 下的记录，避免重复踩坑：
+
+- `docs/DEVELOPMENT_STORY.md`：开发全流程 + 尝试路线总览（CrispASR/Vulkan 失败 → MNN/OpenCL → 蒸馏 → NPU 实验）
+- `docs/PITFALLS_AND_FIXES.md`：全历程踩坑 12 大类总结（现象 → 根因 → 解决 → 汇总表 → 剩余 3 坑 → 三大教训）
+- `docs/RESEARCH_MEMORY.md`：逐日研究记忆（2026-07-14 ~ 08-06）
+- `docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md`：NPU/GPU 定向改造计划（冻结基线 `baseline-20260806`，含"已证明不能重复的路线"红线）
+- `docs/NPU_RELEASE_VALIDATION.md`：v1.1.0 NPU（q_proj 单算子）验证记录
+
+当前未完成实验（QAIRT QNN 全图 HiFT：A16W8 per-channel 24.77ms/12帧 但 PCM corr 0.835 未达标）不进入正式版，状态见 PITFALLS_AND_FIXES.md 第 8 类。

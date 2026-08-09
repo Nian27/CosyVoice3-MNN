@@ -194,7 +194,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 ```
 
 - HiFT 其实就是 HiFi-GAN + F0 预测
-- 支持 CPU 和 OpenCL 后端
+- 后端：CPU（High/6 线程）为主；OpenCL 实测比 CPU 慢（2.89s vs 1.7s，动态长度+小算子搬运开销大），已不使用
 - 输出文件 > 44 字节才算成功
 
 ---
@@ -235,7 +235,11 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 | Flow GPU 耗时 | 0.8 - 1.1 秒 | ~3.4 秒（GPU 编译） |
 | Flow CPU 耗时 | ~2.5 - 3.5 秒（预估） | ~3.5 - 4.0 秒（预估） |
 | HiFT CPU 耗时 | 1.4 - 2.0 秒 | ~1.9 秒 |
-| 进程内存 | ~947 MB | ~947 MB |
+| 进程内存（全 MNN 常驻） | PSS ~2.25 GB | PSS ~2.25 GB |
+
+> 数据日期：2026-07-20 ~ 07-23 真机实测（荣耀 Magic8 Pro / SM8850）。
+> 内存说明：早期单模块常驻 PSS 约 947 MB；LLM+Flow+HiFT 三模块全 MNN 常驻后 PSS 约 2.25 GB
+> （其中 GPU kgsl-3d0 约 1.27 GB），整批合成结束释放 Session 后回落到约 269 MB。
 
 > **非高通手机**：Flow CPU 模式的性能预期比上面 GPU 数据慢 2-3 倍，实测 RTF 可能在 2~3 之间。整体 10 秒文本的合成时间可能在 8~15 秒，仍然可用但不如高通流畅。
 
@@ -247,7 +251,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 |------|------|
 | Android | API 26+（Android 8.0+） |
 | 架构 | arm64-v8a 处理器 |
-| RAM | 推荐 8 GB+（合成时占用 ~1 GB） |
+| RAM | 推荐 8 GB+（全 MNN 常驻峰值 PSS ~2.25 GB，需留足余量） |
 | **存储（模型）** | **至少 1.4 GB**（模型包 ~1.3 GB + 运行时临时文件） |
 | **存储（创建音色）** | **额外 ~974 MB**（可选扩展，不安装不影响合成） |
 | GPU（可选） | 任何 OpenCL 支持的 GPU（Adreno / Mali / PowerVR） |
@@ -450,12 +454,15 @@ Fun-CosyVoice/
 │       │   ├── CosyVoiceFlowNative.kt           # Flow JNI 接口（19 行）
 │       │   ├── CosyVoiceHiFTNative.kt           # HiFT JNI 接口（21 行）
 │       │   └── CosyVoiceEnrollmentNative.kt     # 音色注册 JNI 接口（42 行）
-│       └── jniLibs/arm64-v8a/                   # 5 个 .so，共 32.7 MB
+│       └── jniLibs/arm64-v8a/                   # MNN 全家桶 + 5 个 JNI 包装 .so + Hexagon HTP stub
+│       └── assets/hexagon/                      # DSP Skeleton（libMNN_htpops_skel.so，按 SoC 配套）
 ├── gradle/
 │   └── libs.versions.toml           # 依赖版本目录
 ├── build.gradle.kts                  # 根构建脚本
 ├── settings.gradle.kts               # 项目设置
 ├── gradlew / gradlew.bat             # Gradle Wrapper
+├── mnn-patches/
+│   └── mnn-3.6.1-hexagon-stage-filter.patch  # MNN Hexagon 算子分阶段过滤补丁
 ├── research/
 │   └── mnn-cosyvoice3/              # 完整模型移植研究脚本（可复现的蒸馏/构建/基准）
 │       ├── scripts/*.py              # Python：蒸馏训练、模型导出、数值验证
@@ -463,7 +470,11 @@ Fun-CosyVoice/
 │       ├── STAGE3_FEASIBILITY.md     # Flow 蒸馏可行性报告
 │       └── VOICE_ENROLLMENT*.md      # 音色创建方案
 └── docs/
-    └── DEVELOPMENT_STORY.md          # 开发全流程记录
+    ├── DEVELOPMENT_STORY.md          # 开发全流程记录（含尝试路线总览）
+    ├── RESEARCH_MEMORY.md            # 逐日研究记忆
+    ├── PITFALLS_AND_FIXES.md         # 全历程踩坑 12 大类总结
+    ├── ACCELERATOR_ADAPTATION_PLAN_v1.0.md  # NPU/GPU 定向改造计划
+    └── NPU_RELEASE_VALIDATION.md     # v1.1.0 NPU 验证记录
 ```
 
 ### 核心代码行数统计
@@ -577,7 +588,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | **Kotlin Coroutines** | 异步管线 / Mutex 同步 |
 | **OkHttp 5** | HuggingFace 模型下载 |
 | **阿里 MNN** | LLM / Flow / HiFT 推理引擎 |
-| **OpenCL** | Flow / HiFT GPU 加速 |
+| **OpenCL** | Flow GPU 加速（HiFT 实测 OpenCL 比 CPU 慢，保持 CPU） |
 | **MediaCodec** | 参考音频解码 |
 | **Gradle Version Catalog** | 依赖管理 |
 

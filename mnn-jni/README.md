@@ -1,11 +1,11 @@
 # MNN JNI 原生代码
 
-这 4 个 JNI 包装文件 + 8 个 benchmark 工具是 CosyVoice3 在 Android 上运行的核心 C++ 层。
+这 4 个 JNI 包装文件 + 10 个 benchmark 工具是 CosyVoice3 在 Android 上运行的核心 C++ 层。
 
 ## 编译环境
 
-- **MNN 3.6.0**（阿里 MNN 推理引擎）
-- **Android NDK r26d**（交叉编译到 arm64-v8a）
+- **MNN 3.6.1**（阿里 MNN 推理引擎）
+- **Android NDK r25c**（交叉编译到 arm64-v8a；Hexagon/QNN 构建需与 V81 stub/skel 匹配）
 - **CMake 3.31+** + Ninja
 
 ## 4 个 JNI 包装
@@ -17,7 +17,7 @@
 | `CosyVoiceHiFTJni.cpp` | `run()` / `reset()` | `CosyVoiceHiFTNative.kt` |
 | `CosyVoiceEnrollmentJni.cpp` | `enroll()` | `CosyVoiceEnrollmentNative.kt` |
 
-## 8 个 Benchmark 工具
+## 10 个 Benchmark 工具
 
 独立可执行文件，用于逐模块验证 MNN 推理的速度和数值正确性：
 
@@ -38,9 +38,9 @@
 
 ```powershell
 # 设置环境变量
-$NdkRoot = 'C:\path\to\android-ndk-r26d'
-$MnnSource = 'E:\path\to\MNN-master'
-$BuildDir = '.\build\mnn-3.6-android-arm64-opencl'
+$NdkRoot = 'C:\path\to\android-ndk-r25c'
+$MnnSource = 'E:\path\to\MNN-3.6.1'
+$BuildDir = '.\build\mnn-3.6.1-android-arm64-opencl'
 
 # CMake 配置（交叉编译 arm64-v8a / OpenCL）
 cmake -S $MnnSource -B $BuildDir -G Ninja `
@@ -53,6 +53,10 @@ cmake --build $BuildDir `
     --target cosy_llm_jni cosy_flow_jni cosy_hift_jni cosy_enrollment_jni `
     --parallel 6
 ```
+
+> Hexagon NPU 构建：需在 MNN 3.6.1 上应用 `mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch`，
+> 并使用与目标 SoC 匹配的 Hexagon SDK；同时部署 `libMNN_htpops.so`（Stub）和 DSP Skeleton，
+> 不能只复制 Stub。详见 `docs/NPU_RELEASE_VALIDATION.md`。
 
 输出 .so 文件在 `$BuildDir/tools/cpp/` 下，复制到 `app/src/main/jniLibs/arm64-v8a/` 即可打包到 APK。
 
