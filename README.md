@@ -47,6 +47,7 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 | **MNN + Hexagon NPU（单算子）** | ⚠️ 部分成功：仅 q_proj 放 NPU（wall time -5.94%），收益有限，Token 崩溃风险 | [NPU_RELEASE_VALIDATION.md](docs/NPU_RELEASE_VALIDATION.md)、[加速器改造计划](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
 | **HiFT 切 12 帧窗口上 HTP**（早期尝试） | ❌ 失败：约 4.5 秒/窗口，假执行/异步提交耗时不能当真 | [加速器改造计划 1.3 节](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md) |
 | **QAIRT QNN 全图 HTP 迁移** | ⏳ 进行中：converter 语义已证明（P4.2 WAV corr=1.0）、A16W8 per-channel 达 24.77ms/12帧，但最终 PCM 未达标（corr 0.835） | [PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md) 第 8 类 |
+| **HiFT FP16（corePrecision low）**（2026-08-25 增补） | ✅ 成功：HiFT core 2766→863 ms（约 3.2x），整句热态 RTF 实测 0.82，听感复听验收通过，已作为默认精度 | [RESEARCH_MEMORY.md](docs/RESEARCH_MEMORY.md) |
 
 踩坑红线（已证明不能继续重复）：FP32 HiFT 切 12 帧窗口强行上 HTP；把异步提交时间当真实执行时间；输出不随输入变化的 cache“假执行”；热路径反复 createSession/resizeSession/OpenCL tuning；用离线单窗耗时冒充端到端 RTF。
 
@@ -194,7 +195,8 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 ```
 
 - HiFT 其实就是 HiFi-GAN + F0 预测
-- 后端：CPU（High/6 线程）为主；OpenCL 实测比 CPU 慢（2.89s vs 1.7s，动态长度+小算子搬运开销大），已不使用
+- 后端：CPU（FP16 / low 精度 / 6 线程）为主；OpenCL 实测比 CPU 慢（2.89s vs 1.7s，动态长度+小算子搬运开销大），已不使用
+- 精度：HiFT core 使用 MNN `corePrecision="low"`（FP16），core 由 2766 ms 降到 863 ms（约 3.2x），整句 RTF 实测 0.82；听感已复听验收（2026-08-25），与 fp32 High 无感知差异
 - 输出文件 > 44 字节才算成功
 
 ---
@@ -229,15 +231,15 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 
 | 指标 | 热态（连续合成） | 冷态（首次合成） |
 |------|------------------|------------------|
-| **实时系数（RTF）** | **0.79 - 0.96** | **~1.7** |
+| **实时系数（RTF）** | **0.79 - 0.96**（HiFT FP16 后实测 0.82） | **~1.7** |
 | LLM 耗时 | ~1.6 秒 | ~1.6 秒 |
 | Flow GPU 耗时 | 0.8 - 1.1 秒 | ~3.4 秒（GPU 编译） |
 | Flow CPU 耗时 | ~2.5 - 3.5 秒（预估） | ~3.5 - 4.0 秒（预估） |
-| HiFT CPU 耗时 | 1.4 - 2.0 秒 | ~1.9 秒 |
+| HiFT CPU 耗时 | **0.9 秒（FP16）**｜1.4 - 2.0 秒（fp32 High 历史） | ~1.9 秒（fp32 High 历史） |
 | 进程内存（早期版，单模块常驻） | ~947 MB | ~947 MB |
 | 进程内存（v1.1.0，全 MNN 三模块常驻） | PSS ~2.25 GB | PSS ~2.25 GB |
 
-> 数据日期：2026-07-20 ~ 07-23 真机实测（荣耀 Magic8 Pro / SM8850）。
+> 数据日期：2026-07-20 ~ 07-23 真机实测（荣耀 Magic8 Pro / SM8850）；HiFT FP16 数据：2026-08-25。
 > 内存是**版本不同**：早期版本只有部分模块常驻，PSS 约 947 MB；v1.1.0 的 LLM+Flow+HiFT 三模块全 MNN 常驻后 PSS 约 2.25 GB
 > （其中 GPU kgsl-3d0 约 1.27 GB），整批合成结束释放 Session 后回落到约 269 MB。
 

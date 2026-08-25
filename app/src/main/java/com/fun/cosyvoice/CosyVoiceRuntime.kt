@@ -293,7 +293,7 @@ internal object CosyVoiceRuntime {
             threads = HIFT_CPU_THREADS,
             reportPath = hiftReportFile.absolutePath,
             coreBackend = options.hiftCoreBackend,
-            corePrecision = "high",
+            corePrecision = "low",
             coreCachePath = hiftCache.absolutePath,
             coreGpuMode = if (options.hiftCoreBackend == "cpu") HIFT_CPU_THREADS else options.hiftGpuMode
         )

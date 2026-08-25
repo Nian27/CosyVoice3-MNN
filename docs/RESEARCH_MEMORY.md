@@ -131,3 +131,13 @@
 - LLM Decode 约占耗时 79%（±3%），主要瓶颈在 Decode 而非 Prefill；MNN LLM 重新导出启用 C4/W4 block64 后以 CPU Decode 优化为主，Hexagon 只承担 Prefill 或单算子（q_proj）验证。
 - 精度与听感验收口径：所有基准同时检查 finite、RMS、ONNX 数值误差和“换输入输出必须改变”；App 内模块耗时（L2）与端到端 RTF（L3）分开统计，不能用推理耗时冒充端到端。
 - 最终 NPU 部分成功结论（v1.1.0 验证）：仅 `q_proj` 单算子放 Hexagon，LLM wall time -5.94%、decode TPS +5.93%，收益有限；逐算子出现过 Token 崩溃/非法 Token，未通过的算子不得启用；MNN Hexagon 需按 SoC 配套 stub/skel，默认全部设备走 CPU/OpenCL。详见 `docs/NPU_RELEASE_VALIDATION.md` 与 `mnn-patches/mnn-3.6.1-hexagon-stage-filter.patch`。
+## 2026-08-25 HiFT FP16 默认切换（增补）
+
+- 背景：2026-07-20 曾记录 HiFT CPU Low 相对 High "增益 +2.267 dB、SNR 仅 8.24 dB、禁止用于产品"（见上文 07-20 条目）。本次在 ReaderVoice 探针（同一台 BKQ_AN90 / SM8850、同一 MNN 3.6.1、同一 hift-core.fp32.mnn）做单变量复测：仅把 HiFT core 的 `corePrecision` 从 `"high"` 改为 `"low"`（FP16），Flow/LLM 配置不变。
+- 性能：同一句 204 帧（4.08 秒音频），HiFT core 2766→863 ms（约 3.2x），整句热态 3357 ms → RTF 0.82；Flow 739 ms / LLM 1053 ms 均不变，确认是单变量因果。
+- 听感：所有者复听验收通过（2026-08-25），与 fp32 High 无感知差异，已批准作为默认精度。
+- 与 07-20 记录的关系：07-20 的 SNR 8.24 dB 主要来自 +2.267 dB 恒定增益差（10^(2.267/20)≈1.30，仅增益差本身即可贡献约 10 dB 级误差），并非纯噪声，当时记录未分解增益分量；本次以复听验收 + 增益解释为准。**尚未补做同句 PCM corr/SNR 数值 A/B（探针构建环境 Ninja 缺失中断），列为待办**。
+- 生效：`CosyVoiceRuntime.kt` HiFT `corePrecision="low"`；README 性能数据/阶段 4/尝试路线已同步。
+- 风险：非 SM8850 机型未验证 CPU FP16 路径；长句退化（342→864 帧单位帧耗时翻倍）问题仍在；若数值 A/B 不合格，回退为一行 `"high"`。
+
+
