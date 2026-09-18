@@ -3,6 +3,8 @@
 #include <MNN/MNNForwardType.h>
 #include <MNN/Tensor.hpp>
 
+#include "CosyVoiceHintKnobs.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -203,13 +205,15 @@ int main(int argc, char** argv) {
 
     MNN::BackendConfig backendConfig;
     backendConfig.precision = parsePrecision(precisionName);
-    backendConfig.memory = MNN::BackendConfig::Memory_Normal;
+    backendConfig.memory = cosyvoice_hints::memoryModeFromEnv();
     backendConfig.power = MNN::BackendConfig::Power_High;
     MNN::ScheduleConfig schedule;
     schedule.type = backend;
     schedule.backupType = backend;
     schedule.numThread = threadsOrGpuMode;
     schedule.backendConfig = &backendConfig;
+    // Must run before createSession: hints feed MNN's RuntimeHint.
+    const std::string hintSummary = cosyvoice_hints::applySessionHints(interpreter.get());
     MNN::Session* session = interpreter->createSession(schedule);
     if (!session) {
         return 4;
@@ -292,6 +296,8 @@ int main(int argc, char** argv) {
             << "  \"mode\": \"" << mode << "\",\n"
             << "  \"backend\": \"" << backendName << "\",\n"
             << "  \"precision\": \"" << precisionName << "\",\n"
+            << "  \"memoryMode\": \"" << cosyvoice_hints::memoryModeName(backendConfig.memory) << "\",\n"
+            << "  \"sessionHints\": \"" << hintSummary << "\",\n"
             << "  \"melFrames\": " << melFrames << ",\n"
             << "  \"audioSeconds\": " << melFrames / 50.0 << ",\n"
             << "  \"loadMs\": " << elapsedMs(loadStart) << ",\n"
@@ -313,6 +319,8 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(3) << "mode=" << mode << " backend=" << backendName
               << " precision=" << precisionName << " frames=" << melFrames << " shape=" << shapeString(host)
+              << " memory_mode=" << cosyvoice_hints::memoryModeName(backendConfig.memory)
+              << " hints=" << hintSummary
               << " finite=" << stats.finite << " first_ms=" << firstMs << " median_ms=" << medianMs
               << " memory_mb=" << memoryMb << " rms=" << stats.rms << std::endl;
     return stats.finite ? 0 : 13;

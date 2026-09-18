@@ -51,6 +51,8 @@ CosyVoice3 本地 TTS App。使用阿里 MNN 推理引擎，全部在手机本�
 
 踩坑红线（已证明不能继续重复）：FP32 HiFT 切 12 帧窗口强行上 HTP；把异步提交时间当真实执行时间；输出不随输入变化的 cache“假执行”；热路径反复 createSession/resizeSession/OpenCL tuning；用离线单窗耗时冒充端到端 RTF。
 
+VoiceDesign（文字设计音色）真机内存与 Decoder 配置的五配置实测对比、以及 5 条已失败路线的数据：**[docs/VOICEDESIGN_DEVICE_MEMORY_2026-09-16.md](docs/VOICEDESIGN_DEVICE_MEMORY_2026-09-16.md)**。
+
 完整的踩坑与解决办法：**[docs/PITFALLS_AND_FIXES.md](docs/PITFALLS_AND_FIXES.md)**（全历程 12 大类总结：现象 → 根因 → 解决 → 汇总表 → 剩余 3 坑 → 三大教训）、**[docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md](docs/ACCELERATOR_ADAPTATION_PLAN_v1.0.md)**（冻结基线 `baseline-20260806`）。
 
 ---

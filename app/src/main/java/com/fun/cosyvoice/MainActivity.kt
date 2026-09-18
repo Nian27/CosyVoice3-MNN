@@ -1,8 +1,12 @@
 package com.cosyvoice.app
 
+import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -69,6 +73,7 @@ class MainActivity : ComponentActivity() {
     private var voiceProfiles by mutableStateOf<List<CosyVoiceVoiceProfile>>(emptyList())
     private var selectedVoiceProfileId by mutableStateOf(CosyVoiceStore.DEFAULT_VOICE_PROFILE_ID)
     private var busyMessage by mutableStateOf("")
+    private var designProgress by mutableStateOf("")
     private var resultMessage by mutableStateOf("")
     private var selectedAudioUri by mutableStateOf<Uri?>(null)
     private var selectedAudioName by mutableStateOf("")
@@ -105,14 +110,141 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        CosyVoiceRuntime.initialize(this)
+        // 设计音色路径不需要朗读模型；提前跳过 initialize 可以省下约 1.45 GB 常驻内存，
+        // 否则「朗读模型 + VoiceDesign 4.7G」一起驻留会被 lmkd 杀掉（实测 MemFree 仅 ~200MB）。
+        val designOnly = intent?.getBooleanExtra("autorunDesign", false) == true
+        if (!designOnly) {
+            CosyVoiceRuntime.initialize(this)
+        } else {
+            Log.i("CosyVoice", "autorunDesign：跳过 CosyVoiceRuntime.initialize 以省内存")
+        }
         selectedVoiceProfileId = store.selectedVoiceProfileId()
         refresh()
+        // 无 UI 闭环入口（adb 触发）：
+        //   am start --ez autorunDesign true --es designDesc "…" --es designName "…"
+        // 只跑 enrollment 的快速诊断入口：
+        //   am start --ez enrollOnly true --es enrollWav "/path/to.wav"
+        if (intent?.getBooleanExtra("enrollOnly", false) == true) {
+            runEnrollOnly(intent?.getStringExtra("enrollWav") ?: "")
+        }
+        // 无 UI 合成触发（adb）：
+        //   am start --ez autorunPreview true --es previewText "…" [--es previewVoice <profileId>]
+        // 内存探针：合成一次 → 测 anon → close() → 再测 anon
+        //   am start --ez closeProbe true
+        // 参考音频克隆路径的无 UI 验收入口：
+        //   am start --ez autorunClone true --es cloneWav /path/to.wav --es cloneText "对应文字" --es cloneName "音色名"
+        // 走【和 UI 按钮完全相同】的路径（startDesignService → :design 独立进程），
+        // 用于自动化验证真实用户路径，而不是 Activity 内的 runDesignClosedLoop。
+        // 实验：把某个音色裁剪到实时长度（用于定位 Hexagon 连续解码能接受的 prompt 长度）
+        // am start --ez autorunTrimVoice true --es trimVoiceId voice-xxx
+        // 裁剪长度读 <模型目录>/rt_limit.txt
+        if (intent?.getBooleanExtra("autorunTrimVoice", false) == true) {
+            val vid = intent?.getStringExtra("trimVoiceId").orEmpty()
+            Thread {
+                val r = runCatching { store.createRealtimeVoiceProfile(vid) }
+                    .fold({ "OK id=${it.id} tokens=${it.promptTokenCount} frames=${it.promptFrameCount}" },
+                        { "ERR ${it.javaClass.simpleName}: ${it.message}" })
+                android.util.Log.e("VD_BUILD", "TRIM_RESULT $r")
+                runCatching { File(store.voiceDesignDir, "trim-result.txt").writeText(r + "\n") }
+            }.start()
+        }
+        // GB-SPLIT-P0 探针：am start --ez autorunGb4l true --ei gb4lReps 10
+        if (intent?.getBooleanExtra("autorunGb4l", false) == true) {
+            val reps = intent?.getIntExtra("gb4lReps", 10) ?: 10
+            Thread {
+                val f = File(store.voiceDesignDir, "gb4l-result.txt")
+                val r = runCatching { CosyVoiceVoiceDesignNative.nativeGb4lProbe(store.voiceDesignDir.absolutePath, reps) }
+                    .getOrElse { "ERR " + it.javaClass.simpleName + ": " + it.message }
+                android.util.Log.e("VD_BUILD", "GB4L_RESULT " + r)
+                runCatching { f.writeText(r + "\n") }
+            }.start()
+        }
+        // 【2026-09-18】串行化验证入口：模拟用户连点 N 次（走的是和生产按钮完全相同的
+        // startDesignService 路径，而不是 am start 新 Activity —— 后者到已运行的 Activity
+        // 不会重跑 onCreate，根本到不了 startDesignService）。
+        // am start --ez autorunDesignBurst true --ei burstCount 3
+        if (intent?.getBooleanExtra("autorunDesignBurst", false) == true) {
+            val count = intent?.getIntExtra("burstCount", 3) ?: 3
+            val burstDesc = intent?.getStringExtra("designDesc")
+                ?: "青年女性，声音清冷柔和，语速偏慢，带一点疏离感"
+            scope.launch {
+                repeat(count) { i ->
+                    startDesignService("BURST" + (i + 1), burstDesc,
+                        CosyVoiceVoiceDesigner.DEFAULT_REFERENCE_TEXT, "opencl")
+                    if (i < count - 1) delay(1500)
+                }
+            }
+        }
+        if (intent?.getBooleanExtra("autorunDesignService", false) == true) {
+            startDesignService(
+                name = intent?.getStringExtra("designName") ?: "服务路径测试",
+                description = intent?.getStringExtra("designDesc")
+                    ?: "青年女性，声音清冷柔和，语速偏慢，带一点疏离感",
+                referenceText = CosyVoiceVoiceDesigner.DEFAULT_REFERENCE_TEXT,
+                backend = intent?.getStringExtra("designBackend") ?: "opencl")
+        }
+        if (intent?.getBooleanExtra("autorunClone", false) == true) {
+            runCloneClosedLoop(
+                wavPath = intent?.getStringExtra("cloneWav") ?: "",
+                promptText = intent?.getStringExtra("cloneText") ?: "风从北边吹过来，带着一点凉意，远处那盏灯忽明忽暗。",
+                displayName = intent?.getStringExtra("cloneName") ?: "克隆测试音色")
+        }
+        if (intent?.getBooleanExtra("closeProbe", false) == true) {
+            val lf = File(store.voiceDesignDir, "close-probe.log")
+            fun plog(s: String) { Log.i("CosyVoiceDesign", s); runCatching { lf.appendText(s + "\n") } }
+            runCatching { lf.writeText("") }
+            fun anonKb(): Long = try {
+                File("/proc/self/status").readLines().firstOrNull { it.startsWith("RssAnon:") }
+                    ?.filter { it.isDigit() }?.toLong() ?: -1L
+            } catch (_: Throwable) { -1L }
+            fun rssKb(): Long = try {
+                File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmRSS:") }
+                    ?.filter { it.isDigit() }?.toLong() ?: -1L
+            } catch (_: Throwable) { -1L }
+            Thread {
+                try {
+                    plog("=== close 探针 ===")
+                    plog("A 启动时     rss=" + rssKb() + " anon=" + anonKb())
+                    CosyVoiceRuntime.ensureInitialized(this)
+                    plog("B initialize后 rss=" + rssKb() + " anon=" + anonKb())
+                    val out = File(cacheDir, "probe/p.wav"); out.parentFile?.mkdirs()
+                    kotlinx.coroutines.runBlocking {
+                        CosyVoiceRuntime.synthesize(store, "测试。", out,
+                            CosyVoiceSynthesisOptions(
+                                hardwarePlan = CosyVoiceRuntime.recommendedHardwarePlan(),
+                                voiceProfileId = selectedVoiceProfileId)) { }
+                    }
+                    plog("C 合成后     rss=" + rssKb() + " anon=" + anonKb())
+                    kotlinx.coroutines.runBlocking { CosyVoiceRuntime.close() }
+                    System.gc(); Thread.sleep(1500); System.gc(); Thread.sleep(3000)
+                    plog("D close后    rss=" + rssKb() + " anon=" + anonKb())
+                    plog("=== 结论: close 释放了 " + ((anonKb() - 0)) + " kB (看 C→D 差) ===")
+                } catch (t: Throwable) {
+                    plog("探针失败: " + t.javaClass.simpleName + ": " + t.message)
+                }
+            }.start()
+        }
+
+        if (intent?.getBooleanExtra("autorunPreview", false) == true) {
+            val text = intent?.getStringExtra("previewText") ?: "你好，欢迎使用阅读。"
+            val vid = intent?.getStringExtra("previewVoice")
+            if (!vid.isNullOrBlank()) { selectedVoiceProfileId = vid; store.selectVoiceProfile(vid) }
+            runPreviewClosedLoop(text)
+        }
+        if (intent?.getBooleanExtra("autorunDesign", false) == true) {
+            startDesignService(
+                name = intent?.getStringExtra("designName") ?: "文字设计音色",
+                description = intent?.getStringExtra("designDesc")
+                    ?: CosyVoiceVoiceDesigner.DEFAULT_DESCRIPTION,
+                referenceText = intent?.getStringExtra("designRefText")
+                    ?: CosyVoiceVoiceDesigner.DEFAULT_REFERENCE_TEXT,
+                backend = intent?.getStringExtra("designBackend") ?: "opencl")
+        }
         setContentView(ComposeView(this).apply {
             setContent {
                 CosyVoiceManagerScreen(
                     modelStatus, enrollmentStatus, voiceProfiles, selectedVoiceProfileId,
-                    selectedAudioName, busyMessage, resultMessage,
+                    selectedAudioName, busyMessage, resultMessage, designProgress,
                     onBack = { finish() },
                     onDownloadModel = { downloadModel() },
                     onImportModel = { modelZipLauncher.launch(arrayOf("application/zip", "application/octet-stream")) },
@@ -125,6 +257,7 @@ class MainActivity : ComponentActivity() {
                         startVoiceExport(ids, "cosyvoice3-voices.zip")
                     },
                     onVoiceProfileSelected = { selectVoiceProfile(it) },
+                    onCreateVoiceByDesign = { name, desc, refText -> createVoiceByDesign(name, desc, refText) },
                     onCreateRealtimeVoiceProfile = { createRealtimeVoiceProfile(it) },
                     onDeleteVoiceProfile = { deleteVoiceProfile(it) },
                     onImportEnrollment = { enrollmentZipLauncher.launch(arrayOf("application/zip", "application/octet-stream")) },
@@ -171,6 +304,311 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 界面入口：文字设计音色 -> reference.wav -> enroll -> VoiceProfile。
+     * 与无 UI 闭环走的是同一个编排器，只是带进度回调。
+     */
+    private fun createVoiceByDesign(name: String, description: String, referenceText: String) {
+        if (busyMessage.isNotBlank()) return
+        startDesignService(name, description, referenceText, "opencl")
+    }
+
+    /**
+     * 设计进度轮询。
+     *
+     * 一次设计要 4-9 分钟（decode ~1-3 分钟、decoder ~7 分钟），之前 UI 上只有
+     * 「正在用描述生成音色…」这一句，用户看不到任何进展，会以为卡死。
+     * native 侧每帧写 <模型目录>/progress.txt，这里每秒读一次显示出来。
+     */
+    private var designPollJob: kotlinx.coroutines.Job? = null
+
+    private fun startDesignProgressPolling() {
+        designPollJob?.cancel()
+        val f = File(store.voiceDesignDir, "progress.txt")
+        val state = File(store.voiceDesignDir, "design-state.txt")
+        val seqFile = File(store.voiceDesignDir, "done-seq.txt")
+        fun readSeq(): Int = runCatching {
+            seqFile.takeIf(File::isFile)?.readText()?.trim()?.split(' ')?.firstOrNull()?.toIntOrNull() ?: 0
+        }.getOrDefault(0)
+        val seq0 = readSeq()   // 本轮开始前的完成序号
+        designPollJob = scope.launch {
+            val deadline = System.currentTimeMillis() + 15 * 60 * 1000L
+            while (isActive) {
+                val txt = runCatching { if (f.isFile) f.readText().trim() else "" }.getOrDefault("")
+                if (txt.isNotBlank()) designProgress = txt
+                // 【2026-09-18】权威判据：完成序号变了 = 本轮已结束（成功或失败）。
+                // 不能只看 progress.txt 的文本：下一个排队任务一开头就 writeProgress("")，
+                // UI 每秒轮询很可能错过「完成」，结果新音色一直不出现。
+                if (readSeq() != seq0) {
+                    refresh()
+                    delay(1500)
+                    designProgress = ""
+                    break
+                }
+                // native / Service 写的终态文本（正常情况下序号判据会先命中，这是快速路径）
+                if (txt.startsWith("完成")) {
+                    refresh()
+                    delay(3000)
+                    designProgress = ""
+                    break
+                }
+                if (txt.startsWith("失败")) {
+                    resultMessage = txt
+                    designProgress = ""
+                    refresh()
+                    break
+                }
+                // 【2026-09-18】进程消失兜底：:design 已 idle 却始终没有终态 → 判定异常。
+                // 不要求 txt 非空 —— progress.txt 可能已被下一轮清空。
+                val st = runCatching { if (state.isFile) state.readText().trim() else "" }.getOrDefault("")
+                if (st.startsWith("idle")) {
+                    if (txt.isNotBlank()) {
+                        resultMessage = "设计进程已退出但未报告完成，请查看 design-loop.log（最后进度：$txt）"
+                    }
+                    designProgress = ""
+                    refresh()
+                    break
+                }
+                // 【2026-09-18】超时兜底：任何情况下都不允许永久轮询。
+                if (System.currentTimeMillis() > deadline) {
+                    resultMessage = "设计超过 15 分钟未结束，请查看 design-loop.log（最后进度：$txt）"
+                    designProgress = ""
+                    refresh()
+                    break
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    /** 启动前台服务跑设计（切后台也不会被冻结）。 */
+    private fun startDesignService(name: String, description: String, referenceText: String, backend: String) {
+        val i = Intent(this, CosyVoiceDesignService::class.java)
+            .putExtra(CosyVoiceDesignService.EXTRA_NAME, name)
+            .putExtra(CosyVoiceDesignService.EXTRA_DESC, description)
+            .putExtra(CosyVoiceDesignService.EXTRA_TEXT, referenceText)
+            .putExtra(CosyVoiceDesignService.EXTRA_BACKEND, backend)
+        // 【2026-09-18】串行化的权威在 Service（单槽排队）；这里只做提示，不阻断 ——
+        // 用户连点时的意图通常是"用最新参数重来"，交给 Service 覆盖排队即可。
+        val alreadyRunning = designProgress.isNotBlank()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+        designProgress = "已提交，正在启动…"
+        startDesignProgressPolling()
+        resultMessage = if (alreadyRunning) {
+            "已有设计在运行，本次请求已排队（会覆盖之前排队的请求）。"
+        } else {
+            "已开始设计音色：约 4-9 分钟（解码 1-3 分钟 + 波形 7 分钟）。可切到其它 App，进度见下方。"
+        }
+    }
+
+    @Suppress("unused")
+    private fun createVoiceByDesignInline(name: String, description: String, referenceText: String) {
+        if (busyMessage.isNotBlank()) return
+        scope.launch {
+            busyMessage = "正在用描述生成音色（首次需编译图，约 4-6 分钟）"
+            resultMessage = ""
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    CosyVoiceRuntime.close()
+                    withContext(Dispatchers.Main.immediate) { busyMessage = "正在用描述生成音色…" }
+                    CosyVoiceVoiceDesigner.createFromDesign(
+                        store = store,
+                        nativeLibDir = applicationInfo.nativeLibraryDir,
+                        designModelsDir = store.voiceDesignDir,
+                        description = description,
+                        displayName = name,
+                        backend = "opencl",
+                        referenceText = referenceText
+                    ) { stage ->
+                        // 编排器在主线程外回调，这里直接更新（Compose 会重组）
+                        busyMessage = stage
+                    }
+                }
+            }.onSuccess { profile ->
+                busyMessage = ""
+                refresh()
+                selectVoiceProfile(profile.id)
+                resultMessage = buildString {
+                    append("音色设计完成：").append(profile.displayName)
+                    append(" · ").append(profile.promptTokenCount).append(" Token")
+                    append("\n已自动选中，可直接在下方「合成并试听」。")
+                    append("\n参考音频与描述已保留在音色目录，将来重新注册不必再生成。")
+                }
+            }.onFailure {
+                busyMessage = ""
+                resultMessage = "音色设计失败：" + it.localizedMessage.orEmpty()
+                Log.e("CosyVoice", "voice design failed", it)
+            }
+        }
+    }
+
+    /** 无 UI 合成闭环：用选中音色合成一句话，结果写 synthesis-loop.log。 */
+    private fun runPreviewClosedLoop(text: String) {
+        val logFile = File(store.voiceDesignDir, "synthesis-loop.log")
+        fun log(s: String) { Log.i("CosyVoiceDesign", s); runCatching { logFile.appendText(s + "\n") } }
+        runCatching { logFile.writeText("") }
+        if (!modelStatus.ready) { log("朗读模型未就绪: " + modelStatus.missingFiles.joinToString(",")); return }
+        CosyVoiceRuntime.ensureInitialized(this)
+        Thread {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            try {
+                log("=== 无 UI 合成开始 ===")
+                log("音色: " + selectedVoiceProfileId)
+                log("文本: " + text)
+                val out = File(cacheDir, "cosyvoice-preview/autorun-" + t0 + ".wav")
+                out.parentFile?.mkdirs()
+                val report = kotlinx.coroutines.runBlocking {
+                    CosyVoiceRuntime.synthesize(store, text, out,
+                        CosyVoiceSynthesisOptions(
+                            hardwarePlan = CosyVoiceRuntime.recommendedHardwarePlan(),
+                            voiceProfileId = selectedVoiceProfileId)) { stage -> log("[进度] " + stage) }
+                }
+                log("合成完成: " + report.displayText())
+                log("输出: " + report.output.absolutePath + " bytes=" + report.output.length())
+                runCatching {
+                    val keep = File(store.voiceDesignDir, "last-preview.wav")
+                    report.output.copyTo(keep, overwrite = true)
+                    log("已保存: " + keep.absolutePath + " bytes=" + keep.length())
+                }
+                log("=== 合成成功，耗时 " + (android.os.SystemClock.elapsedRealtime() - t0) + " ms ===")
+            } catch (t: Throwable) {
+                log("=== 合成失败: " + t.javaClass.simpleName + ": " + t.message + " ===")
+                Log.e("CosyVoiceDesign", "preview failed", t)
+            }
+        }.start()
+    }
+
+    /**
+     * 参考音频克隆路径的无 UI 闭环 —— 与「文字设计音色」共用同一个 installEnrolledVoiceProfile()。
+     * 这条路径此前从未跑通过（更早被 JNI 符号问题挡住），需要独立验收。
+     */
+    private fun runCloneClosedLoop(wavPath: String, promptText: String, displayName: String) {
+        val logFile = File(store.voiceDesignDir, "clone-loop.log")
+        fun log(s: String) { Log.i("CosyVoiceDesign", s); runCatching { logFile.appendText(s + "\n") } }
+        runCatching { logFile.writeText("") }
+        CosyVoiceRuntime.ensureInitialized(this)
+        Thread {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            try {
+                log("=== 参考音频克隆闭环开始 ===")
+                log("音色名: " + displayName)
+                log("参考文字: " + promptText)
+                val wav = File(wavPath)
+                log("参考音频: " + wav.absolutePath + " exists=" + wav.isFile + " bytes=" + wav.length())
+                if (!wav.isFile) { log("参考音频不存在"); return@Thread }
+                if (!store.modelStatus().ready) { log("朗读模型未就绪"); return@Thread }
+                if (!store.enrollmentStatus().ready) { log("音色创建扩展未就绪"); return@Thread }
+                // 与 UI 克隆路径一致：先补 dither，避免合成音频的「精确 0 静音」把 campplus 打成 NaN
+                val dithered = File(store.workDir, "clone-dither.wav")
+                wav.copyTo(dithered, overwrite = true)
+                CosyVoiceVoiceDesigner.applyDitherForTest(dithered)
+                log("已补 dither -> " + dithered.absolutePath)
+                val out = File(store.workDir, "clone-out").apply { deleteRecursively(); mkdirs() }
+                val code = CosyVoiceEnrollmentNative.enroll(
+                    tokenizerModelPath = store.enrollmentFile("speech-tokenizer-v3.fp32.inline.mnn").absolutePath,
+                    campPlusModelPath = store.enrollmentFile("campplus.fp32.mnn").absolutePath,
+                    affineWeightPath = store.enrollmentFile("flow-speaker-affine-weight.bin").absolutePath,
+                    affineBiasPath = store.enrollmentFile("flow-speaker-affine-bias.bin").absolutePath,
+                    sourceWavPath = dithered.absolutePath,
+                    outputDirectory = out.absolutePath,
+                    threads = 6)
+                log("enroll exitCode=" + code + " (" + CosyVoiceEnrollmentNative.errorMessage(code) + ")")
+                if (code != 0) { log("=== 克隆失败 ==="); return@Thread }
+                val profile = store.installEnrolledVoiceProfile(
+                    displayName = displayName,
+                    promptText = promptText,
+                    nativeOutputDirectory = out,
+                    sourceWav = wav)
+                log("音色已注册: " + profile.id + " / " + profile.displayName +
+                    " / tokens=" + profile.promptTokenCount + " / frames=" + profile.promptFrameCount)
+                log("=== 克隆成功，耗时 " + (android.os.SystemClock.elapsedRealtime() - t0) + " ms ===")
+            } catch (t: Throwable) {
+                log("=== 克隆失败: " + t.javaClass.simpleName + ": " + t.message + " ===")
+                Log.e("CosyVoiceDesign", "clone loop failed", t)
+            }
+        }.start()
+    }
+
+    /** 只跑 enrollment 的诊断入口（不跑 VoiceDesign），用于隔离问题。 */
+    private fun runEnrollOnly(wavPath: String) {
+        val logFile = File(store.voiceDesignDir, "enroll-only.log")
+        fun log(s: String) {
+            Log.i("CosyVoiceDesign", s)
+            runCatching { logFile.appendText(s + "\n") }
+        }
+        runCatching { logFile.writeText("") }
+        Thread {
+            try {
+                val wav = File(wavPath)
+                log("=== enroll-only 开始 ===")
+                log("wav=" + wav.absolutePath + " exists=" + wav.isFile + " bytes=" + wav.length())
+                if (!wav.isFile) { log("WAV 不存在"); return@Thread }
+                // 打印 WAV 头，确认格式
+                val head = ByteArray(44)
+                wav.inputStream().use { it.read(head) }
+                log("header=" + head.joinToString("") { "%02x".format(it) })
+                // 复制一份并加 dither（与 design 路径一致），避免污染原文件
+                val dithered = File(store.workDir, "enroll-only-dither.wav")
+                dithered.writeBytes(wav.readBytes())
+                CosyVoiceVoiceDesigner.applyDitherForTest(dithered)
+                log("已加 dither -> " + dithered.absolutePath + " bytes=" + dithered.length())
+                val out = File(store.workDir, "enroll-only-out").apply { deleteRecursively(); mkdirs() }
+                val code = CosyVoiceEnrollmentNative.enroll(
+                    tokenizerModelPath = store.enrollmentFile("speech-tokenizer-v3.fp32.inline.mnn").absolutePath,
+                    campPlusModelPath = store.enrollmentFile("campplus.fp32.mnn").absolutePath,
+                    affineWeightPath = store.enrollmentFile("flow-speaker-affine-weight.bin").absolutePath,
+                    affineBiasPath = store.enrollmentFile("flow-speaker-affine-bias.bin").absolutePath,
+                    sourceWavPath = dithered.absolutePath,
+                    outputDirectory = out.absolutePath,
+                    threads = 6)
+                log("exitCode=" + code + " (" + CosyVoiceEnrollmentNative.errorMessage(code) + ")")
+                log("输出文件: " + out.list()?.joinToString(", "))
+                out.listFiles()?.forEach { log("  " + it.name + " = " + it.length() + " bytes") }
+                log("=== enroll-only 结束 ===")
+            } catch (t: Throwable) {
+                log("=== enroll-only 异常: " + t.javaClass.simpleName + ": " + t.message + " ===")
+            }
+        }.start()
+    }
+
+    /**
+     * 无 UI 闭环：文字设计音色 -> reference.wav -> enroll -> VoiceProfile -> 用新音色合成一句。
+     * 进度写 files/cosyvoice3-mnn/design-loop.log，方便 adb 取回。
+     */
+    private fun runDesignClosedLoop(description: String, displayName: String, backend: String) {
+        val logFile = File(store.voiceDesignDir, "design-loop.log")
+        fun log(s: String) {
+            Log.i("CosyVoiceDesign", s)
+            runCatching { logFile.appendText(s + "\n") }
+        }
+        runCatching { logFile.writeText("") }
+        Thread {
+            val t0 = System.currentTimeMillis()
+            try {
+                log("=== 无 UI 闭环开始 ===")
+                log("描述: " + description)
+                log("试听文本: " + CosyVoiceVoiceDesigner.DEFAULT_REFERENCE_TEXT)
+                log("后端: " + backend)
+                val profile = CosyVoiceVoiceDesigner.createFromDesign(
+                    store = store,
+                    nativeLibDir = applicationInfo.nativeLibraryDir,
+                    designModelsDir = store.voiceDesignDir,
+                    description = description,
+                    displayName = displayName,
+                    backend = backend
+                ) { log("[进度] " + it) }
+                log("音色已注册: " + profile.id + " / " + profile.displayName +
+                    " / tokens=" + profile.promptTokenCount + " / frames=" + profile.promptFrameCount)
+                log("音色目录: " + profile.directory.absolutePath)
+                log("目录内容: " + profile.directory.list()?.joinToString(", "))
+                log("=== 闭环成功，总耗时 " + (System.currentTimeMillis() - t0) + " ms ===")
+            } catch (t: Throwable) {
+                log("=== 闭环失败: " + t.javaClass.simpleName + ": " + t.message + " ===")
+                Log.e("CosyVoiceDesign", "design closed loop failed", t)
+            }
+        }.start()
+    }
+
     private fun createVoiceProfile(request: VoiceEnrollmentRequest) {
         if (busyMessage.isNotBlank()) return
         val duration = request.endSeconds - request.startSeconds
@@ -188,6 +626,12 @@ class MainActivity : ComponentActivity() {
                         val sourceWav = File(runDirectory, "source.wav")
                         withContext(Dispatchers.Main.immediate) { busyMessage = "正在解码并截取参考音频" }
                         val decoded = CosyVoiceAudioDecoder.decodeSegmentToWav(this@MainActivity, uri, request.startSeconds, request.endSeconds, sourceWav)
+                        // 关键：enrollment 的 CAMPPlus 前置 fbank 会取 log(能量)，
+                        // 而合成音频（含 VoiceDesign 产物）的静音是「精确 0 样本」-> log(0) = -inf
+                        // -> NaN 传播 -> campplus 输出非有限 -> enroll 返回 37「说话人特征无效」。
+                        // 真实录音有本底噪声不会踩到；但用户完全可能把合成音频当参考导入，
+                        // 所以这里无条件叠加 ±1 LSB（约 -90 dB，听不见）的确定性 dither。
+                        CosyVoiceVoiceDesigner.applyDitherForTest(sourceWav)
                         val nativeOutput = File(runDirectory, "profile").apply { mkdirs() }
                         withContext(Dispatchers.Main.immediate) { busyMessage = "正在提取语音 Token 和说话人特征" }
                         val exitCode = CosyVoiceEnrollmentNative.enroll(
@@ -333,6 +777,8 @@ class MainActivity : ComponentActivity() {
         if (!modelStatus.ready) { resultMessage = "请先导入完整 MNN 模型包"; return }
         val cleanText = text.trim()
         if (cleanText.isBlank()) { resultMessage = "请输入试听文字"; return }
+        // 设计路径会跳过 onCreate 的 initialize 以省内存，所以这里在真正合成前补上（幂等）
+        CosyVoiceRuntime.ensureInitialized(this)
         scope.launch {
             mediaPlayer?.release(); mediaPlayer = null
             busyMessage = "正在启动 MNN 单句链路"; resultMessage = ""
@@ -404,7 +850,7 @@ class MainActivity : ComponentActivity() {
 private fun CosyVoiceManagerScreen(
     modelStatus: CosyVoiceModelStatus, enrollmentStatus: CosyVoiceModelStatus,
     voiceProfiles: List<CosyVoiceVoiceProfile>, selectedVoiceProfileId: String,
-    selectedAudioName: String, busyMessage: String, resultMessage: String,
+    selectedAudioName: String, busyMessage: String, resultMessage: String, designProgress: String,
     onBack: () -> Unit, onDownloadModel: () -> Unit, onImportModel: () -> Unit,
     onExportModel: () -> Unit, onDeleteModel: () -> Unit,
     onImportVoiceProfile: () -> Unit, onExportVoiceProfile: (CosyVoiceVoiceProfile) -> Unit,
@@ -412,6 +858,7 @@ private fun CosyVoiceManagerScreen(
     onCreateRealtimeVoiceProfile: (CosyVoiceVoiceProfile) -> Unit, onDeleteVoiceProfile: (CosyVoiceVoiceProfile) -> Unit,
     onImportEnrollment: () -> Unit, onExportEnrollment: () -> Unit, onDeleteEnrollment: () -> Unit,
     onSelectReferenceAudio: () -> Unit, onCreateVoice: (VoiceEnrollmentRequest) -> Unit,
+    onCreateVoiceByDesign: (String, String, String) -> Unit,
     onPreview: (String, CosyVoiceSynthesisOptions) -> Unit
 ) {
     var previewText by androidx.compose.runtime.remember { mutableStateOf("你好，欢迎使用阅读，这是手机 MNN 本地合成测试。") }
@@ -423,6 +870,11 @@ private fun CosyVoiceManagerScreen(
     var segmentStart by androidx.compose.runtime.remember { mutableStateOf("0") }
     var segmentEnd by androidx.compose.runtime.remember { mutableStateOf("5") }
     val segmentDuration = segmentStart.toDoubleOrNull()?.let { start -> segmentEnd.toDoubleOrNull()?.minus(start) }
+    // 音色创建方式：0 = 参考音频克隆，1 = 文字设计音色
+    var voiceCreateMode by androidx.compose.runtime.remember { mutableStateOf(0) }
+    var designDescription by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceVoiceDesigner.DEFAULT_DESCRIPTION) }
+    var designAdvanced by androidx.compose.runtime.remember { mutableStateOf(false) }
+    var designReferenceText by androidx.compose.runtime.remember { mutableStateOf(CosyVoiceVoiceDesigner.DEFAULT_REFERENCE_TEXT) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding().background(MaterialTheme.colorScheme.background)) {
         Surface(shadowElevation = 2.dp) {
@@ -501,6 +953,64 @@ private fun CosyVoiceManagerScreen(
                     }
                     if (enrollmentStatus.installedBytes > 0L) TextButton(onClick = onDeleteEnrollment, enabled = busyMessage.isBlank()) { Text("删除扩展") }
 
+                    Text("音色创建方式", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ChoiceButton("参考音频克隆", voiceCreateMode == 0, busyMessage.isBlank()) { voiceCreateMode = 0 }
+                        ChoiceButton("文字设计音色", voiceCreateMode == 1, busyMessage.isBlank()) { voiceCreateMode = 1 }
+                    }
+
+                    if (voiceCreateMode == 1) {
+                        OutlinedTextField(voiceName, { voiceName = it },
+                            label = { Text("音色名称（必填）") },
+                            isError = voiceName.isBlank(),
+                            supportingText = { if (voiceName.isBlank()) Text("必填：新音色在角色库里的显示名") },
+                            modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(designDescription, { designDescription = it },
+                            label = { Text("音色描述") },
+                            supportingText = { Text("用自然语言描述声音，例如「青年女性，声音清冷柔和，语速偏慢，带一点疏离感」。不需要任何参考音频。") },
+                            modifier = Modifier.fillMaxWidth(), minLines = 3)
+                        TextButton(onClick = { designAdvanced = !designAdvanced }, enabled = busyMessage.isBlank()) {
+                            Text(if (designAdvanced) "收起高级设置" else "高级设置")
+                        }
+                        if (designAdvanced) {
+                            OutlinedTextField(designReferenceText, { designReferenceText = it },
+                                label = { Text("试听文本") },
+                                supportingText = { Text("设计时会用这段文字生成参考音频；它同时作为 CosyVoice 的参考文字自动登记，所以默认固定、无需填写。") },
+                                modifier = Modifier.fillMaxWidth(), minLines = 2)
+                        }
+                        Text("试听文本：%s".format(designReferenceText), fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        // 按钮禁用时必须说清缺什么，否则用户只会看到「点不动」。
+                        val designBlocker = when {
+                            busyMessage.isNotBlank() -> "正在忙：$busyMessage"
+                            !modelStatus.ready -> "MNN 朗读模型未就绪"
+                            !enrollmentStatus.ready -> "音色创建扩展未安装"
+                            voiceName.isBlank() -> "请先填「音色名称」"
+                            designDescription.isBlank() -> "请先填「音色描述」"
+                            else -> null
+                        }
+                        Button(
+                            onClick = { onCreateVoiceByDesign(voiceName, designDescription, designReferenceText) },
+                            enabled = designBlocker == null,
+                            modifier = Modifier.fillMaxWidth()) { Text("设计并创建音色") }
+                        if (designBlocker != null) {
+                            Text("⚠ 还不能创建：$designBlocker", fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.error)
+                        }
+                        // 设计进行中的实时进度（native 每帧写 progress.txt）
+                        if (designProgress.isNotBlank()) {
+                            Card(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("设计进行中", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Text(designProgress, fontSize = 13.sp)
+                                    Text("可切到其它 App；前台服务会继续跑。", fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                        Text("首次设计需要编译图，约 4-6 分钟。", fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
                     OutlinedButton(onClick = onSelectReferenceAudio, enabled = busyMessage.isBlank()) {
                         Text(if (selectedAudioName.isBlank()) "选择 MP3/音频" else selectedAudioName)
                     }
@@ -521,7 +1031,7 @@ private fun CosyVoiceManagerScreen(
                         },
                         enabled = busyMessage.isBlank() && modelStatus.ready && enrollmentStatus.ready && selectedAudioName.isNotBlank() && voiceName.isNotBlank() && promptText.isNotBlank() && segmentStart.toDoubleOrNull() != null && segmentEnd.toDoubleOrNull() != null,
                         modifier = Modifier.fillMaxWidth()) { Text("创建并选中音色") }
-
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         ChoiceButton("普通复刻", inferenceMode == CosyVoiceInferenceMode.ZERO_SHOT, busyMessage.isBlank()) { inferenceMode = CosyVoiceInferenceMode.ZERO_SHOT }
                         ChoiceButton("指令演绎", inferenceMode == CosyVoiceInferenceMode.INSTRUCT2, busyMessage.isBlank()) { inferenceMode = CosyVoiceInferenceMode.INSTRUCT2 }

@@ -1,0 +1,17 @@
+{
+    "model_type": "qwen2",
+    "hidden_size": 896,
+    "layer_nums": 24,
+    "attention_mask": "float",
+    "attention_type": "full",
+    "is_mrope": false,
+    "sampler_type": "mixed",
+    "temperature": 1.0,
+    "top_k": 25,
+    "top_p": 0.8,
+    "repetition_penalty": 1.1,
+    "jinja": {
+        "chat_template": "{%- for message in messages %}{%- if message['role'] == 'user' %}{{- '<|sos|>' + message['content'] + '<|task_id|>' }}{%- elif message['role'] == 'assistant' %}{{- message['content']}}{%- endif %}{%- endfor %}",
+        "eos": "<|eos1|>"
+    }
+}

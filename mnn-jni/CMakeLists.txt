@@ -43,12 +43,20 @@ add_executable(CosyVoiceHiFTPersistentBenchmark.out ${CMAKE_CURRENT_LIST_DIR}/Co
 list(APPEND MNN_CPP_TOOLS CosyVoiceHiFTPersistentBenchmark.out)
 
 if (MNN_BUILD_LLM)
+    # Only link `llm` explicitly when it is a separate library. MNN_SEP_BUILD is
+    # forced OFF for static builds (MNN CMakeLists.txt:133-136), and in that case
+    # MNN puts $<TARGET_OBJECTS:llm> straight into the MNN archives
+    # (MNN CMakeLists.txt:877-880), so linking `llm` again is a duplicate.
     add_executable(CosyVoiceLlmBenchmark.out ${CMAKE_CURRENT_LIST_DIR}/CosyVoiceLlmBenchmark.cpp)
-    target_link_libraries(CosyVoiceLlmBenchmark.out llm)
+    if (MNN_SEP_BUILD)
+        target_link_libraries(CosyVoiceLlmBenchmark.out llm)
+    endif()
     list(APPEND MNN_CPP_TOOLS CosyVoiceLlmBenchmark.out)
 
     add_executable(CosyVoiceLlmPersistentBenchmark.out ${CMAKE_CURRENT_LIST_DIR}/CosyVoiceLlmPersistentBenchmark.cpp)
-    target_link_libraries(CosyVoiceLlmPersistentBenchmark.out llm)
+    if (MNN_SEP_BUILD)
+        target_link_libraries(CosyVoiceLlmPersistentBenchmark.out llm)
+    endif()
     list(APPEND MNN_CPP_TOOLS CosyVoiceLlmPersistentBenchmark.out)
 
     if (ANDROID)

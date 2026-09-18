@@ -1,11 +1,12 @@
 package com.cosyvoice.app
 
+/*
+ * 注意：真正的 external 声明在 io.legado.app.cosy.CosyVoiceJniBridge.kt ——
+ * 因为预编译的 .so 导出的是 Java_io_legado_app_cosy_* 符号（见 bridge 文件里的说明）。
+ * 本对象只做转发，保持 app 内既有调用点不变。
+ */
 internal object CosyVoiceEnrollmentNative {
-    init {
-        System.loadLibrary("cosy_enrollment_jni")
-    }
-
-    external fun enroll(
+    fun enroll(
         tokenizerModelPath: String,
         campPlusModelPath: String,
         affineWeightPath: String,
@@ -13,9 +14,12 @@ internal object CosyVoiceEnrollmentNative {
         sourceWavPath: String,
         outputDirectory: String,
         threads: Int
-    ): Int
+    ): Int = io.legado.app.cosy.CosyVoiceEnrollmentNative.enroll(
+        tokenizerModelPath, campPlusModelPath, affineWeightPath, affineBiasPath,
+        sourceWavPath, outputDirectory, threads)
 
     fun errorMessage(code: Int): String = when (code) {
+        0 -> "成功"
         10 -> "参考 WAV 无法读取"
         11 -> "参考人声长度不在 3-15 秒"
         12 -> "参考音频特征提取失败"

@@ -1,0 +1,226 @@
+diff --git a/transformers/llm/engine/include/llm/llm.hpp b/transformers/llm/engine/include/llm/llm.hpp
+index b7a06db..5983e6a 100644
+--- a/transformers/llm/engine/include/llm/llm.hpp
++++ b/transformers/llm/engine/include/llm/llm.hpp
+@@ -147,6 +147,7 @@ public:
+     virtual Express::VARP gen_position_ids(int seq_len);
+     virtual Express::VARP embedding(const std::vector<int>& input_ids);
+     virtual int sample(Express::VARP logits, int offset = 0, int size = 0);
++    void setCosyVoiceMinTokens(int minTokens);
+     std::vector<Express::VARP> getOutputs() const;
+     int getOutputIndex(const std::string& name) const;
+     void reset();
+@@ -278,4 +279,4 @@ public:
+ }
+ }
+ 
+-#endif // LLM_hpp
+\ No newline at end of file
++#endif // LLM_hpp
+diff --git a/transformers/llm/engine/src/llm.cpp b/transformers/llm/engine/src/llm.cpp
+index 95965ee..a5e8f2e 100644
+--- a/transformers/llm/engine/src/llm.cpp
++++ b/transformers/llm/engine/src/llm.cpp
+@@ -411,7 +411,8 @@ bool Llm::load() {
+         // attentiion mask var
+         {
+             // Mask: lower triangular
+-           if (mConfig->backend_type() == "cpu" && mValidBlockSize.empty()) {
++           if ((mConfig->backend_type() == "cpu" || mConfig->backend_type() == "hexagon") &&
++               mValidBlockSize.empty()) {
+                mAttentionMaskVarVec[i] = _Input({}, NCHW, halide_type_of<float>());
+                auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
+                ptr[0] = 0;
+@@ -794,6 +795,12 @@ int Llm::sample(VARP logits, int offset, int size) {
+     return token_id;
+ }
+ 
++void Llm::setCosyVoiceMinTokens(int minTokens) {
++    if (mSampler) {
++        mSampler->setCosyVoiceMinTokens(minTokens);
++    }
++}
++
+ void Llm::reset() {
+     mContext->output_tokens.clear();
+     mContext->history_tokens.clear();
+diff --git a/transformers/llm/engine/src/llmconfig.hpp b/transformers/llm/engine/src/llmconfig.hpp
+index e95c672..4c02da3 100644
+--- a/transformers/llm/engine/src/llmconfig.hpp
++++ b/transformers/llm/engine/src/llmconfig.hpp
+@@ -463,6 +463,26 @@ public:
+         return config_.value("topP", 0.9f);
+     }
+ 
++    int cosyvoice_speech_offset() const {
++        return config_.value("cosyvoice_speech_offset", 151924);
++    }
++
++    int cosyvoice_speech_token_count() const {
++        return config_.value("cosyvoice_speech_token_count", 6561);
++    }
++
++    int cosyvoice_eos_token_id() const {
++        return config_.value("cosyvoice_eos_token_id", 158486);
++    }
++
++    int cosyvoice_ras_window() const {
++        return config_.value("cosyvoice_ras_window", 10);
++    }
++
++    float cosyvoice_ras_tau() const {
++        return config_.value("cosyvoice_ras_tau", 0.1f);
++    }
++
+     // backward compatible: min_p > minP
+     float minP() const {
+         float val = config_.value("min_p", -1.0f);
+@@ -634,4 +654,4 @@ public:
+ } // Transformer
+ } // MNN
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/transformers/llm/engine/src/sampler.cpp b/transformers/llm/engine/src/sampler.cpp
+index d070c4a..f4fb750 100644
+--- a/transformers/llm/engine/src/sampler.cpp
++++ b/transformers/llm/engine/src/sampler.cpp
+@@ -68,6 +68,8 @@ void Sampler::SamplerConfig::configSampler(std::string sampler_type, std::shared
+         configPenalty(llmConfig);
+     } else if (sampler_type == "mixed") {
+         configMixed(llmConfig);
++    } else if (sampler_type == "cosyvoice_ras") {
++        configCosyVoiceRas(llmConfig);
+     }
+ }
+ 
+@@ -154,6 +156,18 @@ void Sampler::SamplerConfig::configMixed(std::shared_ptr<LlmConfig> llmConfig) {
+     penalty_window = llmConfig->penalty_window();
+ }
+ 
++void Sampler::SamplerConfig::configCosyVoiceRas(std::shared_ptr<LlmConfig> llmConfig) {
++    topK = llmConfig->topK();
++    topP = llmConfig->topP();
++    temperature = llmConfig->temperature();
++    cosyVoiceSpeechOffset = llmConfig->cosyvoice_speech_offset();
++    cosyVoiceSpeechTokenCount = llmConfig->cosyvoice_speech_token_count();
++    cosyVoiceEosTokenId = llmConfig->cosyvoice_eos_token_id();
++    cosyVoiceRasWindow = llmConfig->cosyvoice_ras_window();
++    cosyVoiceRasTau = llmConfig->cosyvoice_ras_tau();
++    select_type = "temperature";
++}
++
+ Sampler* Sampler::createSampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config) {
+     return new Sampler(context, config);
+ }
+@@ -195,7 +209,11 @@ void Sampler::buildPipeline() {
+         // greedy/temperature handled by stepSelect
+     };
+ 
+-    if (mConfig.type == "mixed") {
++    if (mConfig.type == "cosyvoice_ras") {
++        mPipeline.push_back([this](SamplerState& s) { stepCosyVoiceRange(s); });
++        mPipeline.push_back([this](SamplerState& s) { stepTopK(s); });
++        mPipeline.push_back([this](SamplerState& s) { stepTopP(s); });
++    } else if (mConfig.type == "mixed") {
+         // logit_bias and banned_tokens before other steps
+         if (!mConfig.logit_bias.empty()) {
+             mPipeline.push_back([this](SamplerState& s) { stepLogitBias(s); });
+@@ -222,10 +240,57 @@ int Sampler::sample(Express::VARP logits) {
+     for (auto& step : mPipeline) {
+         step(state);
+     }
++    if (mConfig.type == "cosyvoice_ras" && state.selected_token >= 0) {
++        const auto& decoded = mContext->output_tokens;
++        const int window = std::min<int>(mConfig.cosyVoiceRasWindow, decoded.size());
++        int repeats = 0;
++        for (int i = 0; i < window; ++i) {
++            if (decoded[decoded.size() - 1 - i] == state.selected_token) {
++                ++repeats;
++            }
++        }
++        if (repeats >= mConfig.cosyVoiceRasWindow * mConfig.cosyVoiceRasTau) {
++            SamplerState retry = createState(logits);
++            stepCosyVoiceRange(retry);
++            for (int i = 0; i < (int)retry.indices.size(); ++i) {
++                if (retry.indices[i] == state.selected_token) {
++                    retry.logits[i] = -std::numeric_limits<float>::infinity();
++                    break;
++                }
++            }
++            retry.invalidateProbs();
++            stepSelect(retry);
++            state.selected_token = retry.selected_token;
++        }
++    }
+     mContext->sample_us += _t.durationInUs();
+     return state.selected_token;
+ }
+ 
++void Sampler::stepCosyVoiceRange(SamplerState& state) {
++    const int begin = std::max(0, mConfig.cosyVoiceSpeechOffset);
++    const int end = std::min(state.vocab_size, begin + mConfig.cosyVoiceSpeechTokenCount);
++    std::vector<int> indices;
++    std::vector<float> logits;
++    indices.reserve(std::max(0, end - begin) + 1);
++    logits.reserve(std::max(0, end - begin) + 1);
++    for (int token = begin; token < end; ++token) {
++        indices.push_back(token);
++        logits.push_back(state.logits[token]);
++    }
++    if ((int)mContext->output_tokens.size() >= mConfig.cosyVoiceMinTokens &&
++        mConfig.cosyVoiceEosTokenId >= 0 &&
++        mConfig.cosyVoiceEosTokenId < state.vocab_size &&
++        (mConfig.cosyVoiceEosTokenId < begin || mConfig.cosyVoiceEosTokenId >= end)) {
++        indices.push_back(mConfig.cosyVoiceEosTokenId);
++        logits.push_back(state.logits[mConfig.cosyVoiceEosTokenId]);
++    }
++    state.indices = std::move(indices);
++    state.logits = std::move(logits);
++    state.is_subset = true;
++    state.invalidateProbs();
++}
++
+ // --- Step implementations ---
+ 
+ void Sampler::stepPenalty(SamplerState& state) {
+diff --git a/transformers/llm/engine/src/sampler.hpp b/transformers/llm/engine/src/sampler.hpp
+index f651945..831da81 100644
+--- a/transformers/llm/engine/src/sampler.hpp
++++ b/transformers/llm/engine/src/sampler.hpp
+@@ -55,6 +55,12 @@ public:
+         // logit bias and banned tokens
+         std::unordered_map<int, float> logit_bias;
+         std::vector<int> banned_tokens;
++        int cosyVoiceSpeechOffset = 151924;
++        int cosyVoiceSpeechTokenCount = 6561;
++        int cosyVoiceEosTokenId = 158486;
++        int cosyVoiceRasWindow = 10;
++        float cosyVoiceRasTau = 0.1f;
++        int cosyVoiceMinTokens = 0;
+         void configSampler(std::string sampler_type, std::shared_ptr<LlmConfig> llmConfig);
+         void configGreedy(std::shared_ptr<LlmConfig> llmConfig);
+         void configTemperature(std::shared_ptr<LlmConfig> llmConfig);
+@@ -65,11 +71,13 @@ public:
+         void configTypical(std::shared_ptr<LlmConfig> llmConfig);
+         void configPenalty(std::shared_ptr<LlmConfig> llmConfig);
+         void configMixed(std::shared_ptr<LlmConfig> llmConfig);
++        void configCosyVoiceRas(std::shared_ptr<LlmConfig> llmConfig);
+     };
+ public:
+     static Sampler* createSampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
+     Sampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
+     int sample(MNN::Express::VARP logits);
++    void setCosyVoiceMinTokens(int minTokens) { mConfig.cosyVoiceMinTokens = minTokens > 0 ? minTokens : 0; }
+ private:
+     std::shared_ptr<LlmContext> mContext;
+     SamplerConfig mConfig;
+@@ -88,6 +96,7 @@ private:
+     void stepTypical(SamplerState& state);
+     void stepLogitBias(SamplerState& state);
+     void stepBannedTokens(SamplerState& state);
++    void stepCosyVoiceRange(SamplerState& state);
+     void stepSelect(SamplerState& state);
+ };
+ 

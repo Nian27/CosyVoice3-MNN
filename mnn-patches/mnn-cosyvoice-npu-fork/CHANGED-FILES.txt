@@ -1,0 +1,22 @@
+ .../backend/hexagon/execution/HexagonAttention.cpp |  33 +++-
+ .../hexagon/execution/HexagonExecutionFactory.cpp  |  89 ++++++++++
+ .../htp-ops-lib/src/dsp/attention_common.hpp       |   4 +
+ .../htp-ops-lib/src/dsp/attention_sync_process.cc  |  66 +++++++
+ .../htp-ops-lib/src/dsp/attention_sync_setup.cc    |   3 +-
+ source/backend/qnn/backend/QNNBackend.cpp          | 193 +++++++++++++++++++--
+ source/backend/qnn/backend/QNNBackend.hpp          |   4 +
+ source/backend/qnn/backend/QNNUtils.cpp            |  26 +++
+ source/backend/qnn/execution/QNNActivation.cpp     |  61 ++++++-
+ source/backend/qnn/execution/QNNBinary.cpp         |  97 +++++++++--
+ source/backend/qnn/execution/QNNConcat.cpp         |  12 +-
+ source/backend/qnn/execution/QNNConvolution.cpp    |   1 +
+ source/backend/qnn/execution/QNNInterp.cpp         | 105 ++++++-----
+ source/backend/qnn/execution/QNNPadding.cpp        |  35 +++-
+ source/backend/qnn/execution/QNNPermute.cpp        |  19 +-
+ source/backend/qnn/execution/QNNReshape.cpp        |  37 ++--
+ transformers/llm/engine/include/llm/llm.hpp        |   3 +-
+ transformers/llm/engine/src/llm.cpp                |   9 +-
+ transformers/llm/engine/src/llmconfig.hpp          |  22 ++-
+ transformers/llm/engine/src/sampler.cpp            |  67 ++++++-
+ transformers/llm/engine/src/sampler.hpp            |   9 +
+ 21 files changed, 782 insertions(+), 113 deletions(-)

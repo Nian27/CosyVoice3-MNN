@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.system.Os
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -33,6 +34,10 @@ class CosyVoiceStore(context: Context) {
         const val FIXED_VOICE_NAME = "MNN 基准音色"
         const val DEFAULT_VOICE_PROFILE_ID = "builtin-mnn-reference-v1"
         const val MODEL_ID = "Fun-CosyVoice3-0.5B-2512-RL-distilled-v1"
+        // 【2026-09-18】实时零样本前缀上限。native 侧同名逻辑见 CosyVoiceEnrollmentCore.cpp
+        // 的 maxRealtimePromptTokens()：prompt 太长会让 Hexagon 连续解码无法启用，
+        // LLM 从 ~4 秒掉到 ~47 秒（实测 125 token 必失效、87 token 正常）。
+        // 可用 <模型目录>/rt_limit.txt 覆盖，便于在不重编的前提下定位阈值。
         const val MAX_REALTIME_PROMPT_TOKENS = 125
         private const val VOICE_PROFILE_SCHEMA = 1
         private const val PREFERENCES_NAME = "cosyvoice3-mnn"
@@ -40,11 +45,20 @@ class CosyVoiceStore(context: Context) {
         private const val DEFAULT_PROMPT_TOKENS = 87
         private const val DEFAULT_PROMPT_FRAMES = 174
         private const val SYSTEM_PROMPT_PREFIX = "You are a helpful assistant.<|endofprompt|>"
+
+        // force_llm_sample.json 不允许改写的结构性键（改坏它们会让模型加载失败）。
+        private val STRUCTURAL_LLM_KEYS =
+            setOf("llm_model", "llm_weight", "tokenizer_file", "backend_type")
         private const val PROMPT_PREFIX = SYSTEM_PROMPT_PREFIX + "希望你以后能够做的比我还好呀。"
 
         val MODEL_FILE_SPECS = listOf(
             CosyVoiceModelFileSpec("config-cpu-cosyvoice-ras.json", 504L, "448256EFCC585A151DAB804A8C19F5CC0F6EF846DDAA294D406FF6F3FC2DC081"),
-            CosyVoiceModelFileSpec("llm_config.json", 456L, "81A28DA4C94A85273C5694D85499F760DC37B36766E484AF0581533B641BE41D"),
+            // 注意：llm_config.json **不在此列**。
+            // 它不是模型权重，而是"运行时配置"：MNN-LLM 的采样默认值是全关
+            // （top_k=-1 / top_p=-1 / repetition_penalty=-1），会让生成长度剧烈波动，
+            // 所以本项目必须在它里面写入官方 CosyVoice 的采样参数。
+            // 把它当模型文件校验大小/hash，会导致"修好采样反而判模型缺失"。
+            // 改由 ensureLlmSamplerConfig() 在运行时合并 —— 见下方。
             CosyVoiceModelFileSpec("llm.mnn", 419_640L, "939C364630A8B61E7ACFBDBDA65FA4D0DDC973E751CEF6C2EC84A1E3BB918BAD"),
             CosyVoiceModelFileSpec("llm.mnn.weight", 352_844_666L, "325948C3809FBA1A98C19AA223537D7D984E5DB206BF165A33CC6AEF80470CA3"),
             CosyVoiceModelFileSpec("embeddings_bf16.bin", 284_426_240L, "FF8FBF42A814A2454AAD569218C0DFB271934D9DD14F237F48DEA08124738BB3"),
@@ -80,6 +94,8 @@ class CosyVoiceStore(context: Context) {
     val voiceProfilesDir = File(root, "voices").apply { mkdirs() }
     val enrollmentDir = File(root, "enrollment").apply { mkdirs() }
     val gpuCacheDir = File(root, "gpu-cache").apply { mkdirs() }
+    /** VoiceDesign（文字设计音色）的模型目录：21 个文件，约 4.7 GB。 */
+    val voiceDesignDir = File(root, "voicedesign").apply { mkdirs() }
     val workDir = File(appContext.cacheDir, "cosyvoice3-mnn-work").apply { mkdirs() }
 
     fun selectedVoiceProfileId(): String = preferences.getString(SELECTED_PROFILE_KEY, DEFAULT_VOICE_PROFILE_ID)
@@ -90,6 +106,55 @@ class CosyVoiceStore(context: Context) {
             voiceProfile(id)
         }
         preferences.edit().putString(SELECTED_PROFILE_KEY, id).apply()
+    }
+
+    /**
+     * 采样参数合并 —— 这是一个**运行时配置**，不是模型文件。
+     *
+     * 背景：MNN-LLM 对这些参数的默认值是"全关"
+     *   sampler_type = "mixed"
+     *   temperature  = 1.0
+     *   top_k        = -1        ← 不限制
+     *   top_p        = -1.0      ← 不限制
+     *   repetition_penalty = -1.0 ← 不惩罚
+     * （见 MNN/source/transformers/llm/engine/src/llmconfig.hpp）
+     *
+     * 于是 LLM 相当于从全词表裸采样，生成长度剧烈波动：
+     *   同一句话「你好，我是克隆出来的音色。」实测 3.04 / 10.48 / 20.00 秒（3.4 倍）
+     * 这会让朗读的语速与停顿完全不可控，并且长的那次往往夹带重复内容。
+     *
+     * 官方 CosyVoice 部署（Triton / TRT-LLM）一致使用：
+     *   sampling：top_k=25, top_p=0.8
+     *   repetition_penalty：1.1（runtime/triton_trtllm 下 7 处一致）
+     * 这里照搬官方值。
+     *
+     * 幂等：已经含 repetition_penalty 就跳过，不重写文件（避免每次启动都改 mtime）。
+     *
+     * ⚠️ 2026-09-18 NPU-R8：**本函数写入的采样参数对 LLM 无效。**
+     * C++ 侧只把 `CosyVoiceLlmNative.run(configPath=...)` 收到的那个文件交给
+     * `Llm::createLLM`，也就是 `config-<backend>-cosyvoice-ras-runtime.json`
+     * （由 [llmRuntimeConfig] 从模型文件 `config-cpu-cosyvoice-ras.json` 派生）。
+     * 仓库与构建机两侧的 C++ 运行时代码都不读 `llm_config.json` —— 它只被 Python 导出工具
+     * （`transformers/llm/export/...`）使用。真正生效的采样参数在 `llmRuntimeConfig` 里，
+     * 而它目前只覆盖 backend_type / thread_num / power（+ 两个受控标记）。
+     *
+     * 保留本函数只是为了不改动历史行为；**不要**再往这里加"应该生效"的参数。
+     */
+    fun ensureLlmSamplerConfig() {
+        val file = File(modelDir, "llm_config.json")
+        if (!file.isFile) return
+        val text = runCatching { file.readText() }.getOrNull() ?: return
+        if (text.contains("\"repetition_penalty\"")) return
+        val json = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return
+        json.put("sampler_type", "mixed")
+        json.put("temperature", 1.0)
+        json.put("top_k", 25)
+        json.put("top_p", 0.8)
+        json.put("repetition_penalty", 1.1)
+        runCatching {
+            file.writeText(json.toString(4), Charsets.UTF_8)
+            android.util.Log.i("CosyVoice", "llm_config.json 已写入采样参数（top_k=25 top_p=0.8 repetition_penalty=1.1）")
+        }
     }
 
     fun modelStatus(): CosyVoiceModelStatus {
@@ -283,17 +348,28 @@ class CosyVoiceStore(context: Context) {
         Log.i(TAG, "voice profile deleted id=$id")
     }
 
+    // 【2026-09-18】实时零样本前缀上限（可运行时覆盖）。
+    // 真机实测：prompt 87 token（内置参考音色）→ Hexagon 连续解码启用，LLM ≈ 4 秒；
+    //           prompt 125 token（VoiceDesign 音色）→ 连续解码不启用，LLM ≈ 47 秒。
+    // 用 <模型目录>/rt_limit.txt 覆盖，便于不重编就二分定位 NPU 能接受的阈值。
+    fun realtimePromptTokenLimit(): Int =
+        File(modelDir, "rt_limit.txt")
+            .takeIf(File::isFile)
+            ?.let { runCatching { it.readText().trim().toInt() }.getOrNull() }
+            ?.coerceIn(20, 200) ?: MAX_REALTIME_PROMPT_TOKENS
+
     fun createRealtimeVoiceProfile(id: String): CosyVoiceVoiceProfile {
         val source = loadVoiceProfile(id)
         check(!source.builtIn) { "内置音色已经是实时长度" }
-        check(source.promptTokenCount > MAX_REALTIME_PROMPT_TOKENS) { "当前音色无需优化" }
+        val limit = realtimePromptTokenLimit()
+        check(source.promptTokenCount > limit) { "当前音色无需优化（${source.promptTokenCount} <= $limit）" }
         val targetId = nextAvailableProfileId("${source.id}-realtime")
         val staging = File(voiceProfilesDir, ".$targetId").apply { deleteRecursively(); mkdirs() }
         try {
             val tokens = source.promptSpeechTokensFile.readText(Charsets.US_ASCII)
-                .split(',').map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_REALTIME_PROMPT_TOKENS)
+                .split(',').map { it.trim() }.filter { it.isNotEmpty() }.take(limit)
             File(staging, CosyVoiceVoiceProfile.PROMPT_SPEECH_TOKENS_FILE).writeText(tokens.joinToString(","), Charsets.US_ASCII)
-            val newFrames = MAX_REALTIME_PROMPT_TOKENS * 2
+            val newFrames = limit * 2
             val oldCondition = source.promptConditionFile.readBytes()
             val newCondition = ByteArray(80 * newFrames * 4)
             val oldChannelBytes = source.promptFrameCount * 4
@@ -309,13 +385,13 @@ class CosyVoiceStore(context: Context) {
             Os.symlink(modelFile(CosyVoiceVoiceProfile.SHARED_NOISE_FILE).absolutePath,
                 File(staging, CosyVoiceVoiceProfile.SHARED_NOISE_FILE).absolutePath)
             val sourceText = source.promptPrefix.removePrefix(SYSTEM_PROMPT_PREFIX)
-            val textRatio = MAX_REALTIME_PROMPT_TOKENS.toDouble() / source.promptTokenCount
+            val textRatio = limit.toDouble() / source.promptTokenCount
             val realtimeText = sourceText.take((sourceText.length * textRatio).toInt().coerceAtLeast(1))
             val promptPrefix = SYSTEM_PROMPT_PREFIX + realtimeText
             val profile = CosyVoiceVoiceProfile(
                 schemaVersion = VOICE_PROFILE_SCHEMA, id = targetId,
                 displayName = "${source.displayName}（实时）".take(80), modelId = MODEL_ID,
-                promptPrefix = promptPrefix, promptTokenCount = MAX_REALTIME_PROMPT_TOKENS,
+                promptPrefix = promptPrefix, promptTokenCount = limit,
                 promptFrameCount = newFrames, profileHash = profileHash(promptPrefix, staging),
                 builtIn = false, createdAt = System.currentTimeMillis(), directory = staging)
             File(staging, CosyVoiceVoiceProfile.METADATA_FILE).writeText(profile.toJson().toString(2), Charsets.UTF_8)
@@ -480,14 +556,91 @@ class CosyVoiceStore(context: Context) {
     }
 
     fun llmRuntimeConfig(backend: String = "cpu"): File {
-        require(backend in setOf("cpu", "hexagon")) { "不支持的 LLM 后端：$backend" }
+        // 【2026-09-18】加入 opencl：MNN 的 llm 引擎支持 backend_type=opencl（llm.cpp:45）。
+        // 目的：长句在 CPU 上只有 4~7 tok/s（比文档短句基线 84.99 慢 11~20 倍），
+        // 而历史「OpenCL 不如 CPU」的结论是在**短句**上得出的，不能替长句下判断。
+        require(backend in setOf("cpu", "hexagon", "opencl")) { "不支持的 LLM 后端：$backend" }
         val source = modelFile("config-cpu-cosyvoice-ras.json")
         check(source.isFile) { "缺少 LLM 配置文件" }
         val target = File(modelDir, "config-$backend-cosyvoice-ras-runtime.json")
+        // 【2026-09-18】注入 chunk / chunk_limits。
+        //
+        // 为什么必须在这里注入，而不是直接改源 config：
+        //   config-cpu-cosyvoice-ras.json 在 MODEL_FILE_SPECS 里被当作【模型文件】做校验，
+        //   改它会让 modelStatus().ready 变 false（实测报「朗读模型未就绪」）。
+        //   与 ADR-054 lesson ㉞ 同一类错误：可调参数不能混进被校验的模型清单。
+        //
+        // 为什么需要它们：
+        //   MNN-LLM 的 chunk 决定 decode 一次前进多少 token（llm.cpp:135 读 "chunk"，
+        //   以及 "chunk_limits" 数组，取其中最大值作为 mBlockSize）。
+        //   ⚠️ 2026-09-18 更正：此前据此推断「存在 256 阈值、长句失去 NPU」是**错的**。
+        //   被拒的真实原因是输出出现连续重复 token（longestRun 14~19）。
+        //   ⚠️ 2026-09-18 NPU-R8 再更正：当时写下的「continuousHexagon 为 true，说明 NPU 确实
+        //   在跑」**不成立** —— 该字段只是配置回显（= 配置名含 hexagon 且
+        //   hexagon-stage-layers.txt 非空），而这两样都由 App 自己在调用前写入。
+        //   详见 ADR-053 增补节 NPU-R1/R1b/R1c 与 NPU-R8。
+        //
+        // 【2026-09-18】precision 受控覆盖：<模型目录>/force_llm_precision.txt 内容 high|low。
+        // 动机：同一句长文本下 CPU 输出 0 段连续重复，而 OpenCL 4 段（maxRun 9）、NPU 5 段
+        // （maxRun 14~19）—— 指向数值精度而非算法本身。源 config 是 low，故允许提升后复测。
         val content = JSONObject(source.readText(Charsets.UTF_8))
             .put("backend_type", backend)
             .put("thread_num", 4)
             .put("power", "high")
+            // 【2026-09-18 NPU-R13】默认采样器从 `cosyvoice_ras` 换成「带重复惩罚的 mixed」。
+            //
+            // 依据：`cosyvoice_ras` 的管线是写死的 range → topK → topP → select，**没有任何重复惩罚**
+            // （`repetition_penalty` 只在 `penalty` 这一步生效，而它不在 cosyvoice_ras 的管线里；
+            // 默认 `mixed_samplers` 里也没有 penalty）。于是模型一旦开始重复就再也出不来，
+            // 实测同一句 92 字：6 次尝试里 816/858/610/345/314/33 个 token 的连续重复段，全部撞满上限、
+            // 没有 EOS —— 表现为"只读了一句就没了"。
+            //
+            // 换成 `mixed` + 显式 `penalty` 后，同一句**首次尝试即正常终止**：
+            //   509 token、末位 EOS、unique=371、longestRun=14、invalidOutputs=0
+            // （对照：同一句在 cosyvoice_ras 下 unique 只有 57~219、longestRun 33~858）。
+            // 代价是失去 cosyvoice_ras 的「只从 6561 个语音 token 里采」限制，但实测未出现非法 token
+            // （invalidOutputs=0）；万一出现，质量门会拒掉并重试。
+            //
+            // `<模型目录>/force_llm_sampler.txt` 仍可覆盖回 `cosyvoice_ras` 做对照。
+            .put("sampler_type", "mixed")
+            .put("mixed_samplers", JSONArray(listOf("penalty", "topK", "topP", "temperature")))
+            .put("repetition_penalty", 1.15)
+            .apply {
+                runCatching {
+                    val p = File(modelDir, "force_llm_precision.txt")
+                        .takeIf(File::isFile)?.readText()?.trim()
+                    if (!p.isNullOrEmpty()) put("precision", p)
+                }
+                // 【2026-09-18】采样器受控覆盖：<模型目录>/force_llm_sampler.txt
+                //
+                // 背景：实际生效的采样器是这份 runtime config 里的 "cosyvoice_ras"（定制采样器），
+                // 而不是 llm_config.json 里的 "mixed"。repetition collapse（实测 CPU 出现连续
+                // 266 个相同 token、无 EOS）本质是采样行为，因此换回标准 mixed 采样器直接对照。
+                runCatching {
+                    val s = File(modelDir, "force_llm_sampler.txt")
+                        .takeIf(File::isFile)?.readText()?.trim()
+                    if (!s.isNullOrEmpty()) put("sampler_type", s)
+                }
+                // 【2026-09-18 NPU-R11】通用采样参数覆盖（受控实验用，默认关闭）：
+                // <模型目录>/force_llm_sample.json 里的键会合并进这份 runtime config。
+                // 动机：`cosyvoice_ras` 的候选集要先跟 6561 个语音 token 一起过 top-k / top-p，
+                // EOS 一旦被滤掉，模型就再也停不下来（尾部一路重复到 maxTokens）。
+                // 需要能在设备上直接试「放大 top_k / 放宽 top_p 能否让 EOS 正常出现」。
+                // 结构性键不允许覆盖，避免把模型路径改坏。
+                runCatching {
+                    val f = File(modelDir, "force_llm_sample.json")
+                    if (f.isFile) {
+                        val override = JSONObject(f.readText(Charsets.UTF_8))
+                        override.keys().forEach { key ->
+                            if (key !in STRUCTURAL_LLM_KEYS) put(key, override.get(key))
+                        }
+                    }
+                }
+            }
+            // 【2026-09-18 撤下】曾尝试注入 chunk / chunk_limits 想突破 256 的块上限，
+            // 实测失败：写 chunk=1024 + chunk_limits=[1024,...] 后合成直接卡死、进程被杀。
+            // 原因是 chunk 只能在【模型已编译的静态 shape】里选，不能超出模型支持的上限；
+            // 该模型内建最大的块就是 256。见 ADR-053 增补节的 VC 页边界结论。
             .toString(2)
         if (!target.isFile || target.readText(Charsets.UTF_8) != content) target.writeText(content, Charsets.UTF_8)
         return target

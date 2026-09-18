@@ -1,0 +1,1183 @@
+diff --git a/source/backend/hexagon/execution/HexagonAttention.cpp b/source/backend/hexagon/execution/HexagonAttention.cpp
+index 72b40a3..d0fc821 100644
+--- a/source/backend/hexagon/execution/HexagonAttention.cpp
++++ b/source/backend/hexagon/execution/HexagonAttention.cpp
+@@ -242,21 +242,36 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
+     auto Q = inputs[0];
+     auto K = inputs[1];
+     auto V = inputs[2];
++    MNN_ERROR("HEXATTN build inputs=%zu outputs=%zu qdim=%d kdim=%d vdim=%d qfmt=%d kfmt=%d vfmt=%d "
++              "qbytes=%d kbytes=%d vbytes=%d obytes=%d\n",
++              inputs.size(), outputs.size(), Q != nullptr ? Q->dimensions() : -1,
++              K != nullptr ? K->dimensions() : -1, V != nullptr ? V->dimensions() : -1,
++              Q != nullptr ? (int)TensorUtils::getDescribe(Q)->dimensionFormat : -1,
++              K != nullptr ? (int)TensorUtils::getDescribe(K)->dimensionFormat : -1,
++              V != nullptr ? (int)TensorUtils::getDescribe(V)->dimensionFormat : -1,
++              Q != nullptr ? HexagonBackend::getBytes(Q) : -1,
++              K != nullptr ? HexagonBackend::getBytes(K) : -1,
++              V != nullptr ? HexagonBackend::getBytes(V) : -1,
++              !outputs.empty() ? HexagonBackend::getBytes(outputs[0]) : -1);
+     if (Q == nullptr || K == nullptr || V == nullptr ||
+         Q->dimensions() != 4 || K->dimensions() != 4 || V->dimensions() < 2) {
++        MNN_ERROR("HEXATTN reject=rank_or_null\n");
+         return NOT_SUPPORT;
+     }
+     if (TensorUtils::getDescribe(Q)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 ||
+-        TensorUtils::getDescribe(K)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 ||
+-        TensorUtils::getDescribe(V)->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
++        TensorUtils::getDescribe(K)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
++        MNN_ERROR("HEXATTN reject=layout\n");
+         return NOT_SUPPORT;
+     }
+     if (HexagonBackend::getBytes(Q) != 2 || HexagonBackend::getBytes(K) != 2 ||
+         HexagonBackend::getBytes(V) != 2 || HexagonBackend::getBytes(outputs[0]) != 2) {
++        MNN_ERROR("HEXATTN reject=precision\n");
+         return NOT_SUPPORT;
+     }
+     if (inputs.size() > 3 && inputs[3] != nullptr && inputs[3]->dimensions() > 2 &&
+         HexagonBackend::getBytes(inputs[3]) != 2) {
++        MNN_ERROR("HEXATTN reject=mask_precision maskdim=%d maskbytes=%d\n",
++                  inputs[3]->dimensions(), HexagonBackend::getBytes(inputs[3]));
+         return NOT_SUPPORT;
+     }
+ 
+@@ -269,7 +284,17 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
+ 
+     int n_heads = Q->length(2);
+     int n_kv_heads = K->length(2);
+-    if (V->length(0) != insert_len || V->length(1) != n_kv_heads * head_dim) {
++    const int valueC4 =
++        TensorUtils::getDescribe(V)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 ? 1 : 0;
++    const bool validValueShape =
++        valueC4
++            ? (V->length(0) == insert_len && V->length(1) == n_kv_heads * head_dim)
++            : (V->dimensions() == 4 && V->length(0) == 1 && V->length(1) == insert_len &&
++               V->length(2) == n_kv_heads && V->length(3) == head_dim);
++    if (!validValueShape) {
++        MNN_ERROR("HEXATTN reject=value_shape qo=%d insert=%d heads=%d kvheads=%d dim=%d "
++                  "v0=%d v1=%d\n", qo_len, insert_len, n_heads, n_kv_heads, head_dim,
++                  V->length(0), V->length(1));
+         return NOT_SUPPORT;
+     }
+ 
+@@ -385,7 +410,7 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
+     int maskOffset = maskDev.second;
+ 
+     FlashAttnParam params = {qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim, scale, mask_stride,
+-                             max_kv_len, page_count, page_size, mPageTableCapacity, 1};
++                             max_kv_len, page_count, page_size, mPageTableCapacity, valueC4};
+ 
+     auto pageTableDev = HexagonBackend::getDevicePtr(mPageTable.get());
+     std::vector<std::pair<int, int>> attnInputFds = {qDev, kDev, vDev, {maskFd, maskOffset}, pageTableDev};
+diff --git a/source/backend/hexagon/execution/HexagonExecutionFactory.cpp b/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
+index d7d2684..1cd588c 100644
+--- a/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
++++ b/source/backend/hexagon/execution/HexagonExecutionFactory.cpp
+@@ -22,11 +22,100 @@
+ #include "HexagonRelu6.hpp"
+ #include "HexagonPRelu.hpp"
+ #include "HexagonLSTM.hpp"
++#include "core/TensorUtils.hpp"
++#include "backend/hexagon/backend/HexagonBackend.hpp"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
+ 
+ namespace MNN {
+ 
+ Execution* HexagonExecutionFactory::create(const Op* op, const std::vector<Tensor*>& inputs,
+                                           const std::vector<Tensor*>& outputs, Backend* backend) {
++    const char* selectedLayers = std::getenv("MNN_HEXAGON_LAYERS");
++    if (selectedLayers != nullptr && selectedLayers[0] != '\0') {
++        const std::string opName = op->name() != nullptr ? op->name()->str() : "";
++        bool selected = false;
++        const std::string csv = "," + std::string(selectedLayers) + ",";
++        size_t begin = 0;
++        while (begin < csv.size()) {
++            const size_t end = csv.find(',', begin + 1);
++            if (end == std::string::npos) {
++                break;
++            }
++            const std::string layer = csv.substr(begin + 1, end - begin - 1);
++            if (!layer.empty() &&
++                opName.find("/layers." + layer + "/") != std::string::npos) {
++                selected = true;
++                break;
++            }
++            begin = end;
++        }
++        if (!selected) {
++            return nullptr;
++        }
++    }
++    const char* selectedOps = std::getenv("MNN_HEXAGON_OPS");
++    if (selectedOps != nullptr && selectedOps[0] != '\0') {
++        const std::string kind(selectedOps);
++        const bool selected =
++            (kind == "conv" && op->type() == OpType_Convolution) ||
++            (kind == "layernorm" && op->type() == OpType_LayerNorm) ||
++            (kind == "rope" && op->type() == OpType_RoPE) ||
++            (kind == "binary" && op->type() == OpType_BinaryOp) ||
++            (kind == "unary" && op->type() == OpType_UnaryOp);
++        if (!selected) {
++            return nullptr;
++        }
++    }
++    const char* selectedName = std::getenv("MNN_HEXAGON_NAME");
++    if (selectedName != nullptr && selectedName[0] != '\0') {
++        const std::string opName = op->name() != nullptr ? op->name()->str() : "";
++        if (opName.find(selectedName) == std::string::npos) {
++            return nullptr;
++        }
++        MNN_ERROR("[MNN::Hexagon] staged op=%s\n", opName.c_str());
++    }
++    // CosyVoice3 uses a 158720-wide language-model head. Running this final
++    // projection on Hexagon 3.6.1 currently returns a constant last-vocabulary
++    // logit on SM8850. Keep the transformer body on Hexagon and let MNN's CPU
++    // backup backend execute only the lm_head projection.
++    if (op->name() != nullptr && op->name()->str().find("/lm/lm_head/") != std::string::npos) {
++        return nullptr;
++    }
++    // Keep the production fallback unless an isolated continuous-decode test
++    // explicitly enables Hexagon Attention before the runtime is created.
++    if (op->type() == OpType_Attention) {
++        const char* enabled = std::getenv("MNN_HEXAGON_ATTENTION");
++        if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
++            return nullptr;
++        }
++        const char* selectedLayer = std::getenv("MNN_HEXAGON_ATTENTION_LAYER");
++        const std::string opName = op->name() != nullptr ? op->name()->str() : "";
++        if (selectedLayer != nullptr && selectedLayer[0] != '\0') {
++            const std::string layerNeedle = "/layers." + std::string(selectedLayer) + "/";
++            if (opName.find(layerNeedle) == std::string::npos) {
++                return nullptr;
++            }
++        }
++        MNN_ERROR("HEXATTN factory op=%s inputs=%zu outputs=%zu",
++                  opName.c_str(), inputs.size(), outputs.size());
++        for (size_t i = 0; i < inputs.size(); ++i) {
++            const Tensor* t = inputs[i];
++            MNN_ERROR(" in%zu=[", i);
++            if (t != nullptr) {
++                for (int d = 0; d < t->dimensions(); ++d) {
++                    MNN_ERROR("%s%d", d == 0 ? "" : "x", t->length(d));
++                }
++                MNN_ERROR("] fmt=%d bytes=%d", (int)TensorUtils::getDescribe(t)->dimensionFormat,
++                          HexagonBackend::getBytes(t));
++            } else {
++                MNN_ERROR("null]");
++            }
++        }
++        MNN_ERROR("\n");
++    }
+     switch (op->type()) {
+         case OpType_LayerNorm:
+             return HexagonLayerNorm::create(backend, op);
+diff --git a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_common.hpp b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_common.hpp
+index 27fff6f..4e2f649 100644
+--- a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_common.hpp
++++ b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_common.hpp
+@@ -79,6 +79,10 @@ static inline dma_desc_1d_t* attn_prepare_weight_dma_descs(dma_desc_1d_t* curren
+                                                        vtcm_weight_buf + k_tile_base * 1024,
+                                                        (uint32_t)(tiles * 1024 * sizeof(int16_t)), weight_dma_count,
+                                                        ATTN_HMX_KV_BLOCK_TILES * 1024 * 2, 1024 * kp * 2);
++      // V pages, like K pages above, may have just been updated by push_kv in
++      // the same DSP invocation. Allocate coherent source lines before HMX DMA
++      // reads them; otherwise decode can consume the previous token's V data.
++      weight_descs[weight_desc_count].cache_alloc = DMA_DESC_CACHEALLOC_READONLY;
+       ++weight_desc_count;
+     }
+   }
+diff --git a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_process.cc b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_process.cc
+index 5f19b0d..56864d0 100644
+--- a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_process.cc
++++ b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_process.cc
+@@ -272,8 +272,74 @@ static inline void sync_attention_run_causal_sv_block(const SyncAttentionTaskSta
+   }
+ }
+ 
++static inline float sync_attention_load_page_k(const SyncAttentionTaskState* state, int token, int h_kv, int dim) {
++  const int page = token / state->page_size;
++  const int page_token = token - page * state->page_size;
++  const int seq_tile = page_token / 32;
++  const int seq_inner = page_token % 32;
++  const int dim_tile = dim / 32;
++  const int dim_inner = dim & 31;
++  const __fp16* k_page = (const __fp16*)state->pastKPages[page];
++  const __fp16* k_tile =
++      k_page + attn_hmx_k_tile_index(seq_tile, h_kv, dim_tile, state->n_kv_heads, state->k_icP) * 1024;
++  return (float)k_tile[seq_inner * 2 + (dim_inner / 2) * 64 + (dim_inner & 1)];
++}
++
++// The HMX grouped/page kernels are optimized for small GQA groups.  For larger
++// groups use a simple per-head implementation on DSP as the correctness path.
++// This also gives us a deterministic reference for optimizing those kernels.
++static void sync_attention_process_large_gqa_reference(const SyncAttentionTaskState* state, int head_id,
++                                                       int worker_index) {
++  const int h_kv = head_id / state->gqa_factor;
++  uint8_t* worker_workspace = sync_attention_worker_workspace(state, worker_index);
++  float* scores = NULL;
++  __fp16* weights = NULL;
++  __fp16* temp_O = NULL;
++  sync_attention_workspace_offsets(state, worker_workspace, state->qo_len, &scores, &weights, &temp_O);
++  (void)temp_O;
++
++  __fp16* head_O =
++      state->O + (size_t)head_id * (state->head_dim / 64) * state->qo_total_len * 64;
++  const int mask_start = sync_attention_mask_start_pos(state);
++  for (int q = 0; q < state->qo_len; ++q) {
++    const __fp16* q_ptr = state->Q + (size_t)q * state->qo_stride + head_id * state->head_dim;
++    int valid_n = state->N;
++    if (state->mask_stride < 0) {
++      valid_n = sync_attention_causal_valid_end(state, q + 1);
++    }
++    float* row_scores = scores + (size_t)q * state->N_padded;
++    __fp16* row_weights = weights + (size_t)q * state->N_padded;
++    for (int token = 0; token < valid_n; ++token) {
++      float dot = 0.0f;
++      for (int dim = 0; dim < state->head_dim; ++dim) {
++        dot += (float)q_ptr[dim] * sync_attention_load_page_k(state, token, h_kv, dim);
++      }
++      float score = dot * state->scale;
++      if (state->mask != NULL && state->mask_stride > 0 && token >= mask_start) {
++        score += state->mask[(size_t)q * state->mask_stride + token - mask_start];
++      }
++      row_scores[token] = score;
++    }
++    sync_attention_softmax_row(row_weights, row_scores, valid_n);
++
++    for (int dim = 0; dim < state->head_dim; ++dim) {
++      float value = 0.0f;
++      for (int token = 0; token < valid_n; ++token) {
++        value += (float)row_weights[token] * sync_attention_load_page_v(state, token, h_kv, dim);
++      }
++      const int pack = dim / 64;
++      const int inner = dim & 63;
++      head_O[(size_t)pack * state->qo_total_len * 64 + (state->q_offset + q) * 64 + inner] = (__fp16)value;
++    }
++  }
++}
++
+ static void sync_attention_process_head(const SyncAttentionTaskState* state, int head_id, int worker_index) {
+   const int h_kv = head_id / state->gqa_factor;
++  if (state->page_count > 0 && state->gqa_factor > 4 && state->head_dim % 64 == 0) {
++    sync_attention_process_large_gqa_reference(state, head_id, worker_index);
++    return;
++  }
+   if (sync_attention_try_page_causal_len2(state, head_id, worker_index)) {
+     return;
+   }
+diff --git a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_setup.cc b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_setup.cc
+index 53e9064..d67c745 100644
+--- a/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_setup.cc
++++ b/source/backend/hexagon/htp-ops-lib/src/dsp/attention_sync_setup.cc
+@@ -238,7 +238,8 @@ int sync_attention_can_group_decode(int qo_len, int n_heads, int n_kv_heads, int
+                                                   int mask_stride) {
+   int N_padded = (seq_len + 31) / 32 * 32;
+   if (head_dim % 64 != 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0 ||
+-      n_heads / n_kv_heads <= 1 || N_padded * (int)sizeof(float) < head_dim * (int)sizeof(__fp16)) {
++      n_heads / n_kv_heads <= 1 || n_heads / n_kv_heads > 4 ||
++      N_padded * (int)sizeof(float) < head_dim * (int)sizeof(__fp16)) {
+     return 0;
+   }
+   if (qo_len == 1) {
+diff --git a/source/backend/qnn/backend/QNNBackend.cpp b/source/backend/qnn/backend/QNNBackend.cpp
+index 8bb510f..7a0a983 100644
+--- a/source/backend/qnn/backend/QNNBackend.cpp
++++ b/source/backend/qnn/backend/QNNBackend.cpp
+@@ -11,6 +11,9 @@
+ #include "QnnTypeMacros.hpp"
+ // #define MNN_OPEN_TIME_TRACE
+ #include <MNN/AutoTime.hpp>
++#include <unordered_set>
++#include <string>
++#include <vector>
+ #include "core/FileLoader.hpp"
+ // #define QNN_PROFILE_OP
+ // #define QNN_PROFILE_SUMMARIZE
+@@ -58,8 +61,13 @@ static void createQnnContext(){
+         }
+         bool foundValidInterface = false;
+         for (size_t pIdx = 0; pIdx < numProviders; pIdx++) {
+-            if (QNN_API_VERSION_MAJOR == interfaceProviders[pIdx]->apiVersion.coreApiVersion.major &&
+-                QNN_API_VERSION_MINOR <= interfaceProviders[pIdx]->apiVersion.coreApiVersion.minor) {
++            int provMajor = interfaceProviders[pIdx]->apiVersion.coreApiVersion.major;
++            int provMinor = interfaceProviders[pIdx]->apiVersion.coreApiVersion.minor;
++            // Allow providers whose core API minor is up to 2 versions older than
++            // the SDK headers this MNN was built against. Device firmware (e.g.
++            // ODM-shipped QNN 2.36.8 on SM8850) is often older than the SDK, and
++            // the QnnInterface ABI is backward compatible across adjacent minors.
++            if (QNN_API_VERSION_MAJOR == provMajor && provMinor >= QNN_API_VERSION_MINOR - 2) {
+                 foundValidInterface = true;
+                 qnnInterface = interfaceProviders[pIdx]->QNN_INTERFACE_VER_NAME;
+                 break;
+@@ -1441,11 +1449,34 @@ QnnBackend::QnnBackend(const QnnRuntime* runtime) : Backend(QNN_FORWARD_TYPE), m
+         mPerf->setRpcLatencyAndPolling();
+     }
+ 
+-    // Set mQnnGraphConfig.
++    // Set mQnnGraphConfig. customConfig points to a NULL-terminated array of
++    // HTP-specific custom configs.
+     mQnnHtpGraphCustomConfig.option = QNN_HTP_GRAPH_CONFIG_OPTION_PRECISION;
+-    mQnnHtpGraphCustomConfig.precision = QNN_PRECISION_FLOAT16;
++    // FP32: HiFT's SNAKE activations and deep conv chains overflow fp16
++    // (0*inf -> NaN, accumulation saturates ~65504). Flow/LLM were fine
++    // with fp16, HiFT requires fp32 precision.
++    mQnnHtpGraphCustomConfig.precision = QNN_PRECISION_FLOAT32;
++    // Fast finalize: FINALIZE_OPTIMIZATION_FLAG = 1 -> faster prepare time,
++    // lower graph optimization.
++    mQnnHtpGraphOptConfig.option = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
++    mQnnHtpGraphOptConfig.optimizationOption.type = QNN_HTP_GRAPH_OPTIMIZATION_TYPE_FINALIZE_OPTIMIZATION_FLAG;
++    mQnnHtpGraphOptConfig.optimizationOption.floatValue = 1.0f;
++    mQnnHtpGraphConfigs[0] = &mQnnHtpGraphCustomConfig;
++    mQnnHtpGraphConfigs[1] = &mQnnHtpGraphOptConfig;
++    mQnnHtpGraphHvxConfig.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
++    mQnnHtpGraphHvxConfig.numHvxThreads = 4;
++    mQnnHtpGraphConfigs[2] = &mQnnHtpGraphHvxConfig;
++    mQnnHtpGraphCoresConfig.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_CORES;
++    mQnnHtpGraphCoresConfig.numCores = 4;
++    mQnnHtpGraphConfigs[3] = &mQnnHtpGraphCoresConfig;
++    mQnnHtpGraphConfigs[4] = nullptr;
+     mQnnGraphConfig.option       = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+-    mQnnGraphConfig.customConfig = &mQnnHtpGraphCustomConfig;
++    mQnnGraphConfig.customConfig = mQnnHtpGraphConfigs;
++    fprintf(stderr, "MNN_QNN: precision config mUseFP16=%d htpPrecision=%d hvxThreads=%llu cores=%u\n",
++        (int)mUseFP16, (int)mQnnHtpGraphCustomConfig.precision,
++        (unsigned long long)mQnnHtpGraphHvxConfig.numHvxThreads,
++        (unsigned)mQnnHtpGraphCoresConfig.numCores);
++    fflush(stderr);
+ }
+ 
+ QnnBackend::~QnnBackend() {
+@@ -1467,7 +1498,7 @@ Execution* QnnBackend::onCreate(const std::vector<Tensor*>& inputs, const std::v
+     auto map = getCreatorMap();
+     auto iter = map->find(op->type());
+ 
+-    // MNN_PRINT("MNN_QNN::onCreate Type %d, Name %s.\n", op->type(), op->name()->c_str());
++    fprintf(stderr, "MNN_QNN::onCreate Type %d, Name %s\n", op->type(), op->name()?op->name()->c_str():"?");
+ 
+     if (iter == map->end()) {
+         if(op->name() != nullptr){
+@@ -1534,12 +1565,29 @@ void QnnBackend::onResizeBegin() {
+ }
+ 
+ ErrorCode QnnBackend::onResizeEnd() {
+-    #ifdef QNN_VERBOSE
+-    MNN_PRINT("start finalize\n");
+-    #endif
++    fprintf(stderr, "MNN_QNN: start finalize\n");
++    fflush(stderr);
+     buildOutputCast();
+     buildOutputDequant();
++    fprintf(stderr, "MNN_QNN: before finalizeGraph\n");
++    fflush(stderr);
++    auto finStart = std::chrono::steady_clock::now();
++    std::atomic<bool> finDone{false};
++    std::thread finWatch([&]() {
++        while (!finDone) {
++            std::this_thread::sleep_for(std::chrono::seconds(30));
++            if (finDone) break;
++            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - finStart).count();
++            fprintf(stderr, "MNN_QNN: finalizeGraph still running... %.0f s elapsed\n", secs);
++            fflush(stderr);
++        }
++    });
+     finalizeGraph();
++    finDone = true;
++    if (finWatch.joinable()) finWatch.join();
++    double finSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - finStart).count();
++    fprintf(stderr, "MNN_QNN: after finalizeGraph (%.1f s)\n", finSecs);
++    fflush(stderr);
+     for(auto func : mReleaseFunc){
+         func();
+     }
+@@ -1570,6 +1618,8 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
+         tType = QNN_TENSOR_TYPE_APP_READ;
+     }
+ 
++
++
+     Qnn_DataType_t tDataType;
+     Qnn_QuantizeParams_t tQuantizeParams{};
+     tQuantizeParams.encodingDefinition = QNN_DEFINITION_UNDEFINED;
+@@ -1623,6 +1673,7 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
+     Tensor::DimensionType tensorDimType = tensor->getDimensionType();
+ 
+     std::vector<int> tDims = tensor->shape();
++    MNN_PRINT("MNN_QNN: onAcquire name=%s usage=%d dims=%zu shape=%d,%d,%d,%d fmt=%d\n", tName.c_str(), (int)TensorUtils::getDescribe(tensor)->usage, tDims.size(), (int)(tDims.size()>0?tDims[0]:-1), (int)(tDims.size()>1?tDims[1]:-1), (int)(tDims.size()>2?tDims[2]:-1), (int)(tDims.size()>3?tDims[3]:-1), (int)TensorUtils::getDescribe(tensor)->dimensionFormat);
+     if(TensorUtils::getDescribe(tensor)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4){
+         tensorDimType = gQnnTensorDimType;
+         std::unique_ptr<Tensor> tempTensor(new Tensor(tensor, tensorDimType, false));
+@@ -1631,6 +1682,35 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
+         } else {
+             tDims = {1};
+         }
++        if (tDims.size() == 3) {
++            // The TENSORFLOW-view temp tensor of a 1D conv is {n, h, c}
++            // (height = time, width implicit). QNN Conv2d needs 4-dim
++            // NHWC {n, h, w=1, c}, so insert w=1 after the height axis.
++            std::vector<int> nhwc3;
++            nhwc3.push_back(tDims[0]);
++            nhwc3.push_back(tDims[1]);
++            nhwc3.push_back(1);
++            nhwc3.push_back(tDims[2]);
++            tDims = nhwc3;
++        }
++    } else if (tDims.size() == 3 && TensorUtils::getDescribe(tensor)->dimensionFormat == MNN_DATA_FORMAT_NCHW) {
++        // 3-dim NCHW tensor is {n, c, h} (1D conv / time sequence, width
++        // implicit). QNN needs 4-dim NHWC {n, h, w=1, c}.
++        tensorDimType = gQnnTensorDimType;
++        std::vector<int> nhwc3;
++        nhwc3.push_back(tDims[0]);
++        nhwc3.push_back(tDims[2]);
++        nhwc3.push_back(1);
++        nhwc3.push_back(tDims[1]);
++        tDims = nhwc3;
++    } else if (tDims.size() == 4 && TensorUtils::getDescribe(tensor)->dimensionFormat == MNN_DATA_FORMAT_NCHW) {
++        // 4-dim NCHW {n, c, h, w} must reach QNN as NHWC {n, h, w, c}.
++        // Previously passed through unchanged, silently mislabeling C as H.
++        tensorDimType = gQnnTensorDimType;
++        std::unique_ptr<Tensor> tempTensor(new Tensor(tensor, tensorDimType, false));
++        if (!(tempTensor->shape().empty())) {
++            tDims = tempTensor->shape();
++        }
+     }
+ 
+     std::string suffix = "";
+@@ -1710,6 +1790,8 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
+     }
+ 
+     mTensorCounter += 1;
++
++
+     #ifdef QNN_VERBOSE
+     MNN_PRINT("Total qnn tensor count:%d\n", mTensorCounter);
+     #endif
+@@ -1769,6 +1851,14 @@ void QnnBackend::inputIO(const Tensor* srcTensor, const Tensor* dstTensor) const
+             MNN_ERROR("MNN_QNN: Error in QNNBackend::onCopyBuffer.\n");
+         }
+     }
++    // debug: print first few input values
++    float* d = dstDataContainer.get()->host<float>();
++    fprintf(stderr, "MNN_QNN: inputIO elem=%d srcDimFmt=%d dstDimFmt=%d first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
++        srcTensor->elementSize(),
++        (int)TensorUtils::getDescribe(srcTensor)->dimensionFormat,
++        (int)TensorUtils::getDescribe(dstDataContainer.get())->dimensionFormat,
++        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++    fflush(stderr);
+ }
+ 
+ void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) const {
+@@ -1791,7 +1881,6 @@ void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) cons
+     }
+     std::shared_ptr<QNNTensorWrapper> srcQnnTensorWrapper = mQNNTensorWrappers[srcIndex];
+     std::shared_ptr<Tensor> srcDataContainer = srcQnnTensorWrapper->getDataContainer();
+-
+     // Currently, support float output only.
+     bool valid0 = dstTensor->getType().code == halide_type_float;
+     bool valid1 = dstTensor->getType().code == halide_type_int && dstTensor->getType().bits == 32;
+@@ -1802,6 +1891,27 @@ void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) cons
+     if(TensorUtils::getDescribe(dstTensor)->dimensionFormat == TensorUtils::getDescribe(srcDataContainer.get())->dimensionFormat){
+         ::memcpy(dstTensor->host<float>(), srcDataContainer.get()->host<float>(), srcTensor->elementSize() * sizeof(float));
+     }else{
++        // Manual NHWC(4D) -> NCHW(3D) conversion: CPUTensorConverter writes
++        // zeros for this pattern (verified src [1,961,1,18] -> dst
++        // [1,18,961]). Handle the common HiFT output shape directly.
++        if (srcDataContainer->dimensions() == 4 && dstTensor->dimensions() == 3 &&
++            srcDataContainer->length(0) == dstTensor->length(0) &&
++            srcDataContainer->host<float>() != nullptr && dstTensor->host<float>() != nullptr) {
++            const float* sp = srcDataContainer->host<float>();
++            float* dp = dstTensor->host<float>();
++            int srcH = srcDataContainer->length(1);
++            int srcC = srcDataContainer->length(3);
++            int dstC = dstTensor->length(1);
++            int dstH = dstTensor->length(2);
++            if (srcH == dstH && srcC == dstC) {
++                for (int a = 0; a < srcH; a++) {
++                    for (int c = 0; c < srcC; c++) {
++                        dp[c * srcH + a] = sp[a * srcC + c];
++                    }
++                }
++                return;
++            }
++        }
+         auto code = CPUTensorConverter::convert(srcDataContainer.get(), dstTensor);
+         if (NO_ERROR != code) {
+             MNN_ERROR("MNN_QNN: Error in QNNBackend::onCopyBuffer.\n");
+@@ -1821,6 +1931,11 @@ void QnnBackend::createContextAndGraph() {
+         CALL_QNN(mRuntime->mQnnInterface.graphCreate(mRuntime->mQnnContextHandle, mQnnGraphName.c_str(), pGraphConfig, &mQnnGraphHandle));
+     }
+     MNN_ASSERT(mQnnGraphHandle != nullptr);
++    if (mRuntime->mQnnInterface.graphSetConfig) {
++        Qnn_ErrorHandle_t e2 = mRuntime->mQnnInterface.graphSetConfig(mQnnGraphHandle, pGraphConfig);
++        fprintf(stderr, "MNN_QNN: graphSetConfig ret=0x%x\n", (unsigned)e2);
++        fflush(stderr);
++    }
+ }
+ 
+ void QnnBackend::finalizeGraph() {
+@@ -1855,6 +1970,25 @@ void QnnBackend::executeGraph() const {
+ 
+     // Free temporarily allocated output tensor buffers.
+     freeOutputTensorsTempMemory(outputs.data(), tempBuffers);
++
++
++
++    // Debug: dump first few output values
++    fprintf(stderr, "MNN_QNN: execOut total outputs=%d\n", (int)outputs.size());
++    for (int j = 0; j < (int)outputs.size() && j < 40; j++) {
++        float* p = nullptr;
++        Qnn_Tensor_t t = outputs[j];
++        if (t.v1.memType == QNN_TENSORMEMTYPE_RAW && t.v1.clientBuf.data != nullptr) {
++            p = (float*)t.v1.clientBuf.data;
++        }
++        if (p) {
++            fprintf(stderr, "MNN_QNN: execOut[%d] name=%s first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
++                j, t.v1.name, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++        } else {
++            fprintf(stderr, "MNN_QNN: execOut[%d] name=%s no raw data\n", j, t.v1.name);
++        }
++    }
++    fflush(stderr);
+ }
+ 
+ void QnnBackend::freeContextAndGraph() {
+@@ -1879,9 +2013,23 @@ void QnnBackend::addNodeToGraph(Qnn_OpConfigVersion_t version, const char* nodeN
+     opConfig.v1.numOfOutputs = outputs.size();
+     opConfig.v1.outputTensors = outputs.data();
+ 
++    auto t0 = std::chrono::steady_clock::now();
+     CALL_QNN(mRuntime->mQnnInterface.backendValidateOpConfig(mRuntime->mQnnBackendHandle, opConfig));
+-
++    auto t1 = std::chrono::steady_clock::now();
+     CALL_QNN(mRuntime->mQnnInterface.graphAddNode(mQnnGraphHandle, opConfig));
++    auto t2 = std::chrono::steady_clock::now();
++    double validateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
++    double addMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
++    fprintf(stderr, "MNN_QNN: node %s (%s) out=%s\n", nodeName, nodeType,
++        outputs[0].v1.name ? outputs[0].v1.name : "?");
++    if (validateMs > 200 || addMs > 200) {
++        fprintf(stderr, "MNN_QNN: SLOW node %s (%s) validate=%.1fms add=%.1fms\n", nodeName, nodeType, validateMs, addMs);
++    }
++    static double totalValidateMs = 0;
++    static double totalAddMs = 0;
++    totalValidateMs += validateMs;
++    totalAddMs += addMs;
++    fprintf(stderr, "MNN_QNN: addNode %s (%s) validate=%.1fms add=%.1fms cumulative=%.1fms\n", nodeName, nodeType, validateMs, addMs, totalValidateMs + totalAddMs);
+ }
+ 
+ int QnnBackend::getTensorIdx(const Tensor * tensor) const {
+@@ -1899,6 +2047,7 @@ int QnnBackend::getTensorIdx(const Tensor * tensor) const {
+         MNN_ASSERT(TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT);
+         // MNN_ASSERT(tensor->dimensions() <= 2);
+         std::vector<uint32_t> tDims = getNHWCShape(tensor);
++        MNN_PRINT("MNN_QNN: getTensorIdx const name=%s shape=%d,%d,%d,%d fmt=%d nhwc=%d,%d,%d,%d\n", tName.c_str(), (int)(tensor->shape().size()>0?tensor->shape()[0]:-1), (int)(tensor->shape().size()>1?tensor->shape()[1]:-1), (int)(tensor->shape().size()>2?tensor->shape()[2]:-1), (int)(tensor->shape().size()>3?tensor->shape()[3]:-1), (int)TensorUtils::getDescribe(tensor)->dimensionFormat, (int)(tDims.size()>0?tDims[0]:-1), (int)(tDims.size()>1?tDims[1]:-1), (int)(tDims.size()>2?tDims[2]:-1), (int)(tDims.size()>3?tDims[3]:-1));
+         Qnn_DataType_t tDataType;
+         std::shared_ptr<QNNTensorWrapper> qnnTensorWrapper;
+         if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
+@@ -1906,7 +2055,24 @@ int QnnBackend::getTensorIdx(const Tensor * tensor) const {
+             qnnTensorWrapper = QNNTensorWrapper::createStaticTensor(tName, tDataType, tDims, tensor->host<int>());
+         } else if (tensor->getType().code == halide_type_float) {
+             tDataType = mUseFP16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
+-            qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, tensor->host<float>());
++            // HTP executes with fp16 math regardless of the graph precision
++            // config, so any constant magnitude beyond the fp16 finite range
++            // (~65504) becomes +/-inf on-device and poisons downstream ops
++            // (0*inf -> NaN etc). Clamp constants to the fp16 range.
++            int cNe = tensor->elementSize();
++            const float* cSrc = tensor->host<float>();
++            std::vector<float> cClamped;
++            bool cAny = false;
++            for (int ci = 0; ci < cNe; ci++) {
++                float cv = cSrc[ci];
++                if (cv > 65504.0f) { cv = 65504.0f; cAny = true; }
++                else if (cv < -65504.0f) { cv = -65504.0f; cAny = true; }
++                cClamped.push_back(cv);
++            }
++            if (cAny) {
++                fprintf(stderr, "MNN_QNN: const %s clamped to fp16 range (%d values)\n", tName.c_str(), cNe);
++            }
++            qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, cClamped.data());
+         } else {
+             MNN_ASSERT(false);
+         }
+@@ -2073,8 +2239,6 @@ QnnRuntime::~QnnRuntime() {
+     }
+ }
+ bool QnnRuntime::onSetCache(const void* buffer, size_t size) {
+-    // TODO: Fix bug and complete
+-    return false;
+     if (nullptr == buffer) {
+         return false;
+     }
+@@ -2101,7 +2265,6 @@ void QnnRuntime::freeContext() const {
+ }
+ 
+ std::pair<const void*, size_t> QnnRuntime::onGetCache() {
+-    return std::make_pair(nullptr, 0);
+     if (!mBinaryBuffer.empty()) {
+         return std::make_pair(mBinaryBuffer.data(), mBinaryBuffer.size());
+     }
+diff --git a/source/backend/qnn/backend/QNNBackend.hpp b/source/backend/qnn/backend/QNNBackend.hpp
+index 38db02a..1a2894e 100644
+--- a/source/backend/qnn/backend/QNNBackend.hpp
++++ b/source/backend/qnn/backend/QNNBackend.hpp
+@@ -110,6 +110,10 @@ private:
+     // Qnn Graph
+     Qnn_GraphHandle_t mQnnGraphHandle = nullptr;
+     QnnHtpGraph_CustomConfig_t mQnnHtpGraphCustomConfig{};
++    QnnHtpGraph_CustomConfig_t mQnnHtpGraphOptConfig{};
++    QnnHtpGraph_CustomConfig_t mQnnHtpGraphHvxConfig{};
++    QnnHtpGraph_CustomConfig_t mQnnHtpGraphCoresConfig{};
++    QnnHtpGraph_CustomConfig_t* mQnnHtpGraphConfigs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+     QnnGraph_Config_t mQnnGraphConfig{};
+     const std::string mQnnGraphName = "MNN_QNN_GRAPH";
+ 
+diff --git a/source/backend/qnn/backend/QNNUtils.cpp b/source/backend/qnn/backend/QNNUtils.cpp
+index 6e55696..d88776b 100644
+--- a/source/backend/qnn/backend/QNNUtils.cpp
++++ b/source/backend/qnn/backend/QNNUtils.cpp
+@@ -206,6 +206,32 @@ std::vector<uint32_t> getNHWCShape(const Tensor * tensor) {
+     // only Tensor::CAFFE_C4 convert to Tensor::TENSORFLOW on qnn
+     switch (dataFormat) {
+         case MNN_DATA_FORMAT_NCHW:
++            if (dim == 3) {
++                // 3-dim NCHW tensor from a 1D conv / batched time sequence:
++                // MNN shape is {n, c, h} (channel-major). QNN requires a
++                // 4-dim NHWC tensor {n, h, w=1, c}, so swap c/h and insert
++                // the implicit width axis.
++                std::vector<uint32_t> nchw3(tensorShape);
++                NHWCShape.resize(4);
++                NHWCShape[0] = nchw3[0];
++                NHWCShape[1] = nchw3[2];
++                NHWCShape[2] = 1;
++                NHWCShape[3] = nchw3[1];
++                return NHWCShape;
++            }
++            if (dim == 4) {
++                // 4-dim NCHW {n, c, h, w} must become NHWC {n, h, w, c}
++                // for QNN. Previously this returned the raw NCHW shape,
++                // which silently mislabeled C as H.
++                std::vector<uint32_t> nchw4(tensorShape);
++                NHWCShape.resize(4);
++                NHWCShape[0] = nchw4[0];
++                NHWCShape[1] = nchw4[2];
++                NHWCShape[2] = nchw4[3];
++                NHWCShape[3] = nchw4[1];
++                return NHWCShape;
++            }
++            return tensorShape;
+         case MNN_DATA_FORMAT_NHWC:
+             return tensorShape;
+         case MNN_DATA_FORMAT_NC4HW4:
+diff --git a/source/backend/qnn/execution/QNNActivation.cpp b/source/backend/qnn/execution/QNNActivation.cpp
+index d346c29..fd3a9e0 100644
+--- a/source/backend/qnn/execution/QNNActivation.cpp
++++ b/source/backend/qnn/execution/QNNActivation.cpp
+@@ -15,9 +15,64 @@ namespace QNN {
+ ErrorCode QNNActivation::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+     auto opType = mOp->type();
+     switch (opType) {
+-        case OpType_ReLU:
+-            mNodeType = "Relu";
+-            break;
++        case OpType_ReLU: {
++            float slope = (mOp->main_as_Relu() != nullptr) ? mOp->main_as_Relu()->slope() : 0.0f;
++            if (slope == 0.0f) {
++                mNodeType = "Relu";
++                break;
++            }
++            // LeakyReLU via stable equivalent: y = s*x + (1-s)*ReLU(x)
++            // nodes: Mul(x,s) ; Relu(x) ; Mul(relu, 1-s) ; Add
++            Qnn_DataType_t dt = mBackend->getNativeTensor(inputs[0])->v1.dataType;
++            float s = slope;
++            float om = 1.0f - slope;
++            // strict copy of QNN native tensor rank/dimensions (do not re-derive from MNN logical shape)
++            std::vector<uint32_t> nativeShape;
++            const Qnn_Tensor_t* inT = mBackend->getNativeTensor(inputs[0]);
++            for (uint32_t r = 0; r < inT->v1.rank; r++) nativeShape.push_back(inT->v1.dimensions[r]);
++            std::vector<uint32_t> scalarShape(nativeShape.size(), 1);
++            auto sTensor = createStaticFloatTensor("leaky_s", dt, scalarShape, &s);
++            auto omTensor = createStaticFloatTensor("leaky_1ms", dt, scalarShape, &om);
++            auto t0 = createStageTensor("leaky_mul_s", dt, nativeShape, inputs[0]);
++            auto t1 = createStageTensor("leaky_relu", dt, nativeShape, inputs[0]);
++            auto t2 = createStageTensor("leaky_mul_1ms", dt, nativeShape, inputs[0]);
++            {
++                mNodeType = "ElementWiseMultiply";
++                mParams.clear(); mInputs.clear(); mOutputs.clear();
++                mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
++                mInputs.push_back(*(sTensor->getNativeTensor()));
++                mOutputs.push_back(*(t0->getNativeTensor()));
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++            }
++            {
++                mNodeType = "Relu";
++                mParams.clear(); mInputs.clear(); mOutputs.clear();
++                mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
++                mOutputs.push_back(*(t1->getNativeTensor()));
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++            }
++            {
++                mNodeType = "ElementWiseMultiply";
++                mParams.clear(); mInputs.clear(); mOutputs.clear();
++                mInputs.push_back(*(t1->getNativeTensor()));
++                mInputs.push_back(*(omTensor->getNativeTensor()));
++                mOutputs.push_back(*(t2->getNativeTensor()));
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++            }
++            {
++                mNodeType = "ElementWiseAdd";
++                mParams.clear(); mInputs.clear(); mOutputs.clear();
++                mInputs.push_back(*(t0->getNativeTensor()));
++                mInputs.push_back(*(t2->getNativeTensor()));
++                mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++            }
++            return NO_ERROR;
++        }
+         case OpType_ReLU6:
+             mNodeType = "ReluMinMax";
+             this->createParamScalar("min_value", mOp->main_as_Relu6()->minValue());
+diff --git a/source/backend/qnn/execution/QNNBinary.cpp b/source/backend/qnn/execution/QNNBinary.cpp
+index 0942362..0b25a6a 100644
+--- a/source/backend/qnn/execution/QNNBinary.cpp
++++ b/source/backend/qnn/execution/QNNBinary.cpp
+@@ -37,6 +37,75 @@ ErrorCode QNNBinary::onEncode(const std::vector<Tensor *> &inputs, const std::ve
+         return this->onEncodeBroadcast(inputs, outputs, fullIndex);
+     }
+ 
++    // Scale-decompose multiply constants whose magnitude exceeds the fp16
++    // finite range (~65504). HTP computes with fp16 math regardless of the
++    // graph precision config, so such constants become +/-inf on-device and
++    // poison downstream ops. Instead of clamping (which distorts the value),
++    // split the op:  x * C  ->  (x * (C/scale)) * scale, keeping both
++    // intermediate values inside the fp16 range.
++    if (mBinaryTypeName == "ElementWiseMultiply") {
++        int cIdx = -1;
++        for (int i = 0; i < 2; i++) {
++            if (TensorUtils::getDescribe(inputs[i])->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
++                cIdx = i;
++                break;
++            }
++        }
++        if (cIdx >= 0 && inputs[cIdx]->host<float>() != nullptr) {
++            const float* cd = inputs[cIdx]->host<float>();
++            int cn = inputs[cIdx]->elementSize();
++            float cmax = 0.0f;
++            for (int j = 0; j < cn; j++) {
++                cmax = std::max(cmax, fabsf(cd[j]));
++            }
++            if (cmax > 65504.0f) {
++                float scale = 1.0f;
++                while (cmax / scale > 60000.0f) scale *= 2.0f;
++                std::vector<float> sData(cn);
++                for (int j = 0; j < cn; j++) sData[j] = cd[j] / scale;
++                auto cT = mBackend->getNativeTensor(inputs[cIdx]);
++                std::vector<uint32_t> cDims;
++                for (uint32_t r = 0; r < cT->v1.rank; r++) cDims.push_back(cT->v1.dimensions[r]);
++                Qnn_DataType_t dt = cT->v1.dataType;
++                auto sTensor = createStaticFloatTensor("scaled_const", dt, cDims, sData.data());
++                float scaleF = scale;
++                auto scaleTensor = createStaticFloatTensor("scale_scalar", dt, {1}, &scaleF);
++                auto tmp = createStageTensor("scaled_mul", dt, getNHWCShape(outputs[0]), outputs[0]);
++                // node 1: multiply(full, scaled_const) -> tmp
++                {
++                    mNodeType = "ElementWiseMultiply";
++                    mParams.clear();
++                    mInputs.clear();
++                    mOutputs.clear();
++                    if (cIdx == 1) {
++                        mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
++                        mInputs.push_back(*(sTensor->getNativeTensor()));
++                    } else {
++                        mInputs.push_back(*(sTensor->getNativeTensor()));
++                        mInputs.push_back(*(mBackend->getNativeTensor(inputs[1])));
++                    }
++                    mOutputs.push_back(*(tmp->getNativeTensor()));
++                    mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                             mNodeType.c_str(), mParams, mInputs, mOutputs);
++                }
++                // node 2: multiply(tmp, scale_scalar) -> output
++                {
++                    mNodeType = "ElementWiseMultiply";
++                    mParams.clear();
++                    mInputs.clear();
++                    mOutputs.clear();
++                    mInputs.push_back(*(tmp->getNativeTensor()));
++                    mInputs.push_back(*(scaleTensor->getNativeTensor()));
++                    mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
++                    mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                             mNodeType.c_str(), mParams, mInputs, mOutputs);
++                }
++
++                return NO_ERROR;
++            }
++        }
++    }
++
+     mNodeType = mBinaryTypeName;
+     this->addNodeCommon(inputs, outputs);
+ 
+@@ -49,6 +118,12 @@ ErrorCode QNNBinary::onEncodeScalarOptimize(const std::vector<Tensor *> &inputs,
+     Qnn_DataType_t dataType = mBackend->getNativeTensor(inputs[fullIndex])->v1.dataType;
+ 
+     std::vector<uint32_t> dim(inputs[fullIndex]->dimensions(), 1);
++    // If the full input was converted from 3-D NCHW to 4-D NHWC, make the
++    // reshaped scalar 4-D as well so the ElementWise broadcast ranks match.
++    std::vector<uint32_t> stageShape = getNHWCShape(inputs[fullIndex]);
++    if (stageShape.size() != dim.size()) {
++        dim.assign(stageShape.size(), 1);
++    }
+ 
+     this->createStageTensor("stage_0", dataType, dim, inputs[fullIndex]); // mTempTensorWrappers[0]
+     this->createStageTensor("stage_1", dataType, shape, inputs[fullIndex]); // mTempTensorWrappers[1]
+@@ -69,26 +144,14 @@ ErrorCode QNNBinary::onEncodeScalarOptimize(const std::vector<Tensor *> &inputs,
+         mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+     }
+ 
+-    // Tile
+-    {
+-        CLEAR_BEFORE_ADDING_NODE;
+-
+-        std::string name = mNodeName + "_Tile";
+-        mNodeType = "Tile";
+-
+-        mInputs.push_back(*(mTempTensorWrappers[0]->getNativeTensor())); // stage 0
+-        mParams.push_back(*(mParamTensorWrappers[0]->getNativeParam())); // multiples
+-        mOutputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor())); // stage 1
+-
+-        mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+-    }
+-
+     // Binary
+     // Ensure correct input order for non-commutative operations (Sub, Div, Pow, etc.)
+     // input0Tensor corresponds to original inputs[0], input1Tensor corresponds to original inputs[1]
++    // NOTE: Tile was removed because QNN HTP rejects it for scalar patterns;
++    // ElementWise ops natively broadcast the reshaped scalar (stage 0).
+     const auto& input0Tensor = (fullIndex == 0) ? *(mBackend->getNativeTensor(inputs[fullIndex]))
+-                                                : *(mTempTensorWrappers[1]->getNativeTensor());
+-    const auto& input1Tensor = (fullIndex == 0) ? *(mTempTensorWrappers[1]->getNativeTensor())
++                                                : *(mTempTensorWrappers[0]->getNativeTensor());
++    const auto& input1Tensor = (fullIndex == 0) ? *(mTempTensorWrappers[0]->getNativeTensor())
+                                                 : *(mBackend->getNativeTensor(inputs[fullIndex]));
+     {
+         CLEAR_BEFORE_ADDING_NODE;
+@@ -100,7 +163,7 @@ ErrorCode QNNBinary::onEncodeScalarOptimize(const std::vector<Tensor *> &inputs,
+             mInputs.push_back(input1Tensor);
+         } else {
+             mInputs.push_back(*(mBackend->getNativeTensor(inputs[fullIndex]))); // full input
+-            mInputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor()));    // stage 1
++            mInputs.push_back(*(mTempTensorWrappers[0]->getNativeTensor()));    // stage 0
+         }
+         mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
+ 
+diff --git a/source/backend/qnn/execution/QNNConcat.cpp b/source/backend/qnn/execution/QNNConcat.cpp
+index c57588c..a554bf1 100644
+--- a/source/backend/qnn/execution/QNNConcat.cpp
++++ b/source/backend/qnn/execution/QNNConcat.cpp
+@@ -41,7 +41,17 @@ ErrorCode QNNConcat::onEncode(const std::vector<Tensor *> &inputs, const std::ve
+     // (expressed in MNN's NCHW ordering) must be remapped into the NHWC ordering QNN sees.
+     //   axis 0 (N) -> 0 ; axis 1 (C) -> dim-1 (last) ; axis k>1 (spatial) -> k-1
+     int realAxis = axis;
+-    if (TensorUtils::getDescribe(output)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
++    if (dim == 3) {
++        // 3-dim tensors are converted to 4-dim NHWC {n, h, w, c} before QNN
++        // sees them. Remap the MNN axis accordingly regardless of the MNN
++        // tensor's own dimension format (both NCHW and NC4HW4 3-dim tensors
++        // become NHWC): axis 0 (N) -> 0; axis 1 (C) -> 3 (last); axis 2 (H) -> 1.
++        if (axis == 1) {
++            realAxis = 3;
++        } else if (axis == 2) {
++            realAxis = 1;
++        }
++    } else if (TensorUtils::getDescribe(output)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
+         if (axis > 1) {
+             realAxis = axis - 1;
+         } else if (axis == 1) {
+diff --git a/source/backend/qnn/execution/QNNConvolution.cpp b/source/backend/qnn/execution/QNNConvolution.cpp
+index ae3ca14..5a63246 100644
+--- a/source/backend/qnn/execution/QNNConvolution.cpp
++++ b/source/backend/qnn/execution/QNNConvolution.cpp
+@@ -685,6 +685,7 @@ bool QNNConvolution::createWeightAndBias(Qnn_DataType_t dataType, const Tensor *
+         }
+         this->createStaticFloatTensor("weight", floatDatatype, {(uint32_t)kernelH, (uint32_t)kernelW, (uint32_t)ic / (uint32_t)group, (uint32_t)oc}, weightData.data());
+         this->createBias(dataType, oc, input, nullptr);
++
+     }
+     return NO_ERROR;
+ }
+diff --git a/source/backend/qnn/execution/QNNInterp.cpp b/source/backend/qnn/execution/QNNInterp.cpp
+index 3fdd221..aacda35 100644
+--- a/source/backend/qnn/execution/QNNInterp.cpp
++++ b/source/backend/qnn/execution/QNNInterp.cpp
+@@ -19,53 +19,77 @@ ErrorCode QNNInterp::onEncode(const std::vector<Tensor *> &inputs, const std::ve
+ 
+     auto interpParam = mOp->main_as_Interp();
+     int resizeType = interpParam->resizeType();
+-    bool alignCorners = interpParam->alignCorners();
+-    bool halfPixelCenters = interpParam->halfPixelCenters();
+-
+-    // MNN resizeType: 1=nearest, 2=bilinear, 3=cubic, 4=nearest_round
+-    // Use QNN "Resize" op which supports interpolation_mode + transformation_mode
+ 
+-    mNodeType = "Resize";
+-
+-    // Determine interpolation mode
+-    uint32_t interpolationMode;
++    // HTP ResizeNearestNeighbor is BROKEN on FP32: it copies the input to the
++    // start of the output and zero-fills the rest (verified with a minimal
++    // model: out = [in..., 0, 0, ...] instead of nearest 8x repeat). The
++    // generic Resize fails validation (3110). Implement nearest upsampling
++    // with a blocked repeat via Concat + Reshape instead:
++    //   in NHWC {n,h,w,c} -> Concat x factor along C -> {n,h,w,c*factor}
++    //                     -> Reshape -> {n,h*factor,w,c}
++    // flat order [h][c] (c innermost), so Concat on C repeats each h's c
++    // block `factor` times; reshaping groups them as h' = h*factor + r.
+     if (resizeType == 1 || resizeType == 4) {
+-        interpolationMode = QNN_OP_RESIZE_INTERPOLATION_MODE_NEAREST;
+-    } else if (resizeType == 2) {
+-        interpolationMode = QNN_OP_RESIZE_INTERPOLATION_MODE_LINEAR;
+-    } else if (resizeType == 3) {
+-        interpolationMode = QNN_OP_RESIZE_INTERPOLATION_MODE_CUBIC;
+-    } else {
+-        interpolationMode = QNN_OP_RESIZE_INTERPOLATION_MODE_NEAREST;
+-    }
+-
+-    // Determine transformation mode
+-    uint32_t transformationMode;
+-    if (alignCorners) {
+-        transformationMode = QNN_OP_RESIZE_TRANSFORMATION_MODE_ALIGN_CORNERS;
+-    } else if (halfPixelCenters) {
+-        transformationMode = QNN_OP_RESIZE_TRANSFORMATION_MODE_HALF_PIXEL;
+-    } else {
+-        transformationMode = QNN_OP_RESIZE_TRANSFORMATION_MODE_ASYMMETRIC;
++        auto inT = mBackend->getNativeTensor(inputs[0]);
++        auto outT = mBackend->getNativeTensor(outputs[0]);
++        if (inT->v1.rank == 4 && outT->v1.rank == 4) {
++            uint32_t n = inT->v1.dimensions[0], h = inT->v1.dimensions[1];
++            uint32_t w = inT->v1.dimensions[2], c = inT->v1.dimensions[3];
++            uint32_t on = outT->v1.dimensions[0], oh = outT->v1.dimensions[1];
++            uint32_t ow = outT->v1.dimensions[2], oc = outT->v1.dimensions[3];
++            uint32_t factor = 0;
++            std::vector<uint32_t> reshp;
++            if (h > 0 && oh == h * (oh / h) && ow == w && oc == c && oh / h >= 2) {
++                factor = oh / h;                 // upsampled on H
++                reshp = {n, oh, w, c};
++            } else if (w > 0 && ow == w * (ow / w) && oh == h && oc == c && ow / w >= 2) {
++                factor = ow / w;                 // upsampled on W
++                reshp = {n, h, ow, c};
++            }
++            if (factor >= 2) {
++                // 1) Concat `factor` copies of input along C (axis 3):
++                //    flat is [..][c] with c innermost, so this repeats each
++                //    spatial position's c block `factor` times.
++                std::vector<uint32_t> tmpDims = {n, h, w, c * factor};
++                auto tmp = createStageTensor("ups_rep", QNN_DATATYPE_FLOAT_32, tmpDims, nullptr);
++                mNodeType = "Concat";
++                mParams.clear();
++                mInputs.clear();
++                mOutputs.clear();
++                this->createParamScalar("axis", (uint32_t)3);
++                mParams.push_back(*(mParamScalarWrappers.back()->getNativeParam()));
++                for (uint32_t i = 0; i < factor; i++) {
++                    mInputs.push_back(*inT);
++                }
++                mOutputs.push_back(*(tmp->getNativeTensor()));
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++                // 2) Reshape to output dims (groups factor consecutive c
++                //    blocks back to a spatial position: blocked repeat).
++                mNodeType = "Reshape";
++                mParams.clear();
++                mInputs.clear();
++                mOutputs.clear();
++                mInputs.push_back(*(tmp->getNativeTensor()));
++                mOutputs.push_back(*outT);
++                mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
++                                         mNodeType.c_str(), mParams, mInputs, mOutputs);
++
++                return NO_ERROR;
++            }
++        }
++        MNN_PRINT("MNN_QNN: Interp nearest fallback (non-integer factor)\n");
+     }
+ 
+-    this->createParamScalar("interpolation_mode", interpolationMode);
+-    this->createParamScalar("transformation_mode", transformationMode);
+-    this->createParamScalar("exclude_outside", (uint32_t)0);
++    bool alignCorners = interpParam->alignCorners();
++    bool halfPixelCenters = interpParam->halfPixelCenters();
+ 
+-    if (resizeType == 1 || resizeType == 4) {
+-        uint32_t nearestMode = (resizeType == 4)
+-            ? QNN_OP_RESIZE_NEAREST_MODE_ROUND_PREFER_FLOOR
+-            : QNN_OP_RESIZE_NEAREST_MODE_FLOOR;
+-        this->createParamScalar("nearest_mode", nearestMode);
+-    }
++    // bilinear/cubic: HTP ResizeBilinear passes validation
++    mNodeType = "ResizeBilinear";
+ 
+-    if (resizeType == 3) {
+-        float cubicCoeff = interpParam->cubicCoeffA();
+-        this->createParamScalar("cubic_coeff", cubicCoeff);
+-    }
++    this->createParamScalar("align_corners", (bool)alignCorners);
++    this->createParamScalar("half_pixel_centers", (bool)halfPixelCenters);
+ 
+-    // Add params
+     for (int i = 0; i < mParamScalarWrappers.size(); i++) {
+         mParams.push_back(*(mParamScalarWrappers[i]->getNativeParam()));
+     }
+@@ -75,7 +99,6 @@ ErrorCode QNNInterp::onEncode(const std::vector<Tensor *> &inputs, const std::ve
+ 
+     mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
+                              mNodeType.c_str(), mParams, mInputs, mOutputs);
+-
+     return NO_ERROR;
+ }
+ 
+diff --git a/source/backend/qnn/execution/QNNPadding.cpp b/source/backend/qnn/execution/QNNPadding.cpp
+index 62c1f33..4715e63 100644
+--- a/source/backend/qnn/execution/QNNPadding.cpp
++++ b/source/backend/qnn/execution/QNNPadding.cpp
+@@ -26,10 +26,41 @@ ErrorCode QNNPadding::onEncode(const std::vector<Tensor *> &inputs, const std::v
+     auto dimensions = input->dimensions();
+     MNN_ASSERT(size == (2 * dimensions));
+ 
+-    this->createParamScalar("scheme", (uint32_t) 0); // 0 means 'CONSTANT'
++    // Map MNN PadValueMode to QNN pad scheme. Previously hardcoded to
++    // CONSTANT, which broke REFLECT pads (e.g. HiFT mel padding -> zero
++    // fill instead of mirror, diverging conv_pre from frame 4 onward).
++    //   MNN: CONSTANT=0 REFLECT=1 SYMMETRIC=2 EDGE=3
++    //   QNN: CONSTANT=0 MIRROR_SYMMETRIC=1 MIRROR_REFLECT=2 EDGE=3
++    uint32_t scheme = QNN_OP_PAD_SCHEME_CONSTANT;
++    if (mOp->main_type() == OpParameter_PadParam && mOp->main_as_PadParam() != nullptr) {
++        auto padMode = mOp->main_as_PadParam()->mode();
++        if (padMode == PadValueMode_REFLECT) {
++            scheme = QNN_OP_PAD_SCHEME_MIRROR_REFLECT;
++        } else if (padMode == PadValueMode_SYMMETRIC) {
++            scheme = QNN_OP_PAD_SCHEME_MIRROR_SYMMETRIC;
++        } else if (padMode == PadValueMode_EDGE) {
++            scheme = QNN_OP_PAD_SCHEME_EDGE;
++        }
++    }
++    this->createParamScalar("scheme", scheme);
+     mParams.push_back(*(mParamScalarWrappers.back()->getNativeParam()));
+ 
+-    this->createParamTensor("pad_amount", QNN_DATATYPE_UINT_32, {(uint32_t)dimensions, 2}, (void *) paddingDataSrc);
++    // For 3-D NCHW input converted to 4-D NHWC, remap the pad_amount rows
++    // from [n, c, h] order to [n, h, w, c] order (w gets all zeros).
++    std::vector<uint32_t> paddedAmount;
++    if (dimensions == 3) {
++        uint32_t padN0 = (uint32_t)paddingDataSrc[0];
++        uint32_t padN1 = (uint32_t)paddingDataSrc[1];
++        uint32_t padC0 = (uint32_t)paddingDataSrc[2];
++        uint32_t padC1 = (uint32_t)paddingDataSrc[3];
++        uint32_t padH0 = (uint32_t)paddingDataSrc[4];
++        uint32_t padH1 = (uint32_t)paddingDataSrc[5];
++        // NHWC: n, h, w, c
++        paddedAmount = {padN0, padN1, padH0, padH1, 0, 0, padC0, padC1};
++        this->createParamTensor("pad_amount", QNN_DATATYPE_UINT_32, {4, 2}, (void *) paddedAmount.data());
++    } else {
++        this->createParamTensor("pad_amount", QNN_DATATYPE_UINT_32, {(uint32_t)dimensions, 2}, (void *) paddingDataSrc);
++    }
+     mParams.push_back(*(mParamTensorWrappers.back()->getNativeParam()));
+ 
+     mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
+diff --git a/source/backend/qnn/execution/QNNPermute.cpp b/source/backend/qnn/execution/QNNPermute.cpp
+index 79e6e69..c2eac54 100644
+--- a/source/backend/qnn/execution/QNNPermute.cpp
++++ b/source/backend/qnn/execution/QNNPermute.cpp
+@@ -28,13 +28,14 @@ ErrorCode QNNPermute::onEncode(const std::vector<Tensor *> &inputs, const std::v
+     #endif
+ 
+     mNodeType = "Transpose";
++    MNN_PRINT("MNN_QNN: Permute %s dim=%d op=%d inShape=%d,%d,%d,%d\n", mNodeName.c_str(), dim, (int)mOp->type(), (int)(input->shape().size()>0?input->shape()[0]:-1), (int)(input->shape().size()>1?input->shape()[1]:-1), (int)(input->shape().size()>2?input->shape()[2]:-1), (int)(input->shape().size()>3?input->shape()[3]:-1));
+     std::vector<uint32_t> mapRaw(dim, 0);
++    int permSize = dim;
+     if (mOp->type() == OpType_Permute) {
+         auto param = mOp->main_as_Permute();
+         auto axis = param->dims();
+-        int size = (int) param->dims()->size();
+-        MNN_ASSERT(size == dim);
+-        for (int i = 0; i < dim; i++) {
++        permSize = (int) param->dims()->size();
++        for (int i = 0; i < dim && i < permSize; i++) {
+             int index = axis->Get(i);
+             mapRaw[i] = (uint32_t)index;
+         }
+@@ -44,6 +45,18 @@ ErrorCode QNNPermute::onEncode(const std::vector<Tensor *> &inputs, const std::v
+             mapRaw[i] = (uint32_t)permutation[i];
+         }
+     }
++    // When the MNN graph works on 3-dim NCHW tensors but the QNN tensors are
++    // 4-dim NHWC {n,h,w,c}, the 3-dim layout perm ({0,2,1}) is already realized
++    // by the shape conversion, so the Transpose must be dropped (identity).
++    // Detect this case by the perm describing only 3 axes while the tensor is 4-dim.
++    fprintf(stderr, "MNN_QNN: Permute %s dim=%d permSize=%d mapRaw=[%u,%u,%u,%u] inShape=%d,%d,%d,%d\n", mNodeName.c_str(), dim, permSize, mapRaw[0], mapRaw[1], mapRaw[2], dim>3?mapRaw[3]:0, (int)(input->shape().size()>0?input->shape()[0]:-1), (int)(input->shape().size()>1?input->shape()[1]:-1), (int)(input->shape().size()>2?input->shape()[2]:-1), (int)(input->shape().size()>3?input->shape()[3]:-1));
++    fflush(stderr);
++    if (dim == 3 || permSize <= 3) {
++        std::vector<uint32_t> identity4 = {0, 1, 2, 3};
++        this->createParamTensor("perm", QNN_DATATYPE_UINT_32, {4}, identity4.data());
++        this->addNodeCommon(inputs, outputs, 1, 1);
++        return NO_ERROR;
++    }
+     
+     this->createParamTensor("perm", QNN_DATATYPE_UINT_32, {(uint32_t) dim}, mapRaw.data());
+     this->addNodeCommon(inputs, outputs, 1, 1);
+diff --git a/source/backend/qnn/execution/QNNReshape.cpp b/source/backend/qnn/execution/QNNReshape.cpp
+index 46025d5..ab47b7b 100644
+--- a/source/backend/qnn/execution/QNNReshape.cpp
++++ b/source/backend/qnn/execution/QNNReshape.cpp
+@@ -18,31 +18,24 @@ ErrorCode QNNReshape::onEncode(const std::vector<Tensor *> &inputs, const std::v
+     mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
+     mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
+     
+-    if(inputDimFormat == MNN_DATA_FORMAT_NC4HW4 && outputDimFormat == MNN_DATA_FORMAT_NCHW){
+-        mNodeType = "Transpose";
++    // All QNN tensors are 4-dim NHWC {n,h,w,c}; the NC4HW4<->NCHW layout
++    // conversion is already realized by onAcquire's shape conversion, so a
++    // ConvertTensor between these formats is the identity. Emitting a real
++    // Transpose with the NC4HW4-derived perm would corrupt the layout and
++    // fail QNN validation on 3-dim tensors.
++    bool isLayoutConvert = (inputDimFormat == MNN_DATA_FORMAT_NC4HW4 && outputDimFormat == MNN_DATA_FORMAT_NCHW) ||
++                           (outputDimFormat == MNN_DATA_FORMAT_NC4HW4 && inputDimFormat == MNN_DATA_FORMAT_NCHW);
++    if (isLayoutConvert) {
+         uint32_t dim = inputs[0]->shape().size();
+-        std::vector<uint32_t> permData(dim, 0);
+-        permData[0] = 0;
+-        permData[1] = dim - 1;
+-        for (int i = 2; i < dim; i++) {
+-            permData[i] = i - 1;
++        std::vector<uint32_t> identityPerm;
++        if (dim <= 3) {
++            identityPerm = {0, 1, 2, 3};
++        } else {
++            identityPerm.resize(dim);
++            for (uint32_t i = 0; i < dim; i++) identityPerm[i] = i;
+         }
+-        this->createParamTensor("perm", QNN_DATATYPE_UINT_32, {dim}, (void *)permData.data());
+-        mParams.push_back(*(mParamTensorWrappers.back()->getNativeParam()));
+-        mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+-        return NO_ERROR;
+-    }
+-    
+-    if(outputDimFormat == MNN_DATA_FORMAT_NC4HW4 && inputDimFormat == MNN_DATA_FORMAT_NCHW){
+         mNodeType = "Transpose";
+-        uint32_t dim = inputs[0]->shape().size();
+-        std::vector<uint32_t> permData(dim, 0);
+-        permData[0] = 0;
+-        permData[dim - 1] = 1;
+-        for (int i = 1; i < dim - 1; i++) {
+-            permData[i] = i + 1;
+-        }
+-        this->createParamTensor("perm", QNN_DATATYPE_UINT_32, {dim}, (void *)permData.data());
++        this->createParamTensor("perm", QNN_DATATYPE_UINT_32, {(uint32_t)identityPerm.size()}, identityPerm.data());
+         mParams.push_back(*(mParamTensorWrappers.back()->getNativeParam()));
+         mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+         return NO_ERROR;
