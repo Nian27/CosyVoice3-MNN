@@ -1,13 +1,13 @@
 {
-  "release": "v1.1.0",
-  "versionCode": 2,
+    "release": "v1.2.0",
+  "versionCode": 3,
   "applicationId": "com.cosyvoice.app",
   "mnnVersion": "3.6.1",
   "androidAbi": "arm64-v8a",
   "apk": {
-    "name": "CosyVoice3-MNN-v1.1.0-arm64.apk",
-    "bytes": 27795217,
-    "sha256": "A25D6E0822F000724E6E8599B6D28EC791ECCCEE9162CBF76FF7EF2E088EC996"
+    "name": "CosyVoice3-MNN-v1.2.0-arm64.apk",
+    "bytes": 12378500,
+    "sha256": "0151381BD96A3C0142242ED0E423CA1EADC3198AA9E7E8CE5B83E0EBE8C36CEB"
   },
   "models": [
     {
